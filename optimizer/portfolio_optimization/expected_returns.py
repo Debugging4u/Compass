@@ -70,9 +70,16 @@ import pandas as pd
 # codelib — used directly, no wrapper (lean design).
 from codelib.portfolio_optimization.black_litterman import BlackLitterman
 
-# Stage 3 output: annualised preferred covariance (LW constant-variance) and
-# the weekly log-return DataFrame with named columns.
-from portfolio_optimization.correlation_matrix import cov_preferred, returns
+# Stage 3: asset order (no I/O), the universe loader, and the covariance
+# recipe — cov_preferred itself is no longer a module-level value (see
+# correlation_matrix.py's import-time contract), so it's built below from
+# get_default_universe() instead of imported directly.
+from portfolio_optimization.correlation_matrix import (
+    ASSET_NAMES,
+    COV_METHOD,
+    compute_cov_preferred,
+    get_default_universe,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -442,17 +449,15 @@ def build_expected_returns(
 
 
 # ---------------------------------------------------------------------------
-# Module-level output: the single alias Stage 5 imports (parallels cov_preferred)
-# ---------------------------------------------------------------------------
-
-ASSET_NAMES = list(returns.columns)
-
-
-# ---------------------------------------------------------------------------
 # Diagnostics (run only when executed directly, mirroring Stage 3/5 style)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    universe = get_default_universe()
+    cov_preferred = compute_cov_preferred(
+        universe.returns, universe.market_returns, method=COV_METHOD,
+    )
+
     mu_preferred, _bl = build_expected_returns(
         cov_preferred, ASSET_NAMES, views=VIEWS,
     )

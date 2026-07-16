@@ -47,21 +47,30 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# Public Stage 5 API — jittered solves go through the exact same path
-# Weekly return history — only used for T, the effective sample size that
-# scales the jitter.
-from portfolio_optimization.correlation_matrix import returns
+# Stage 3 — universe loader + covariance recipe. Weekly return history is
+# only used for T, the effective sample size that scales the jitter.
+#
+# NOTE: this module previously imported `mu_preferred` from expected_returns
+# and `COV` from optimal_portfolio at module level — neither name actually
+# existed there (both are built only inside those modules' `__main__` blocks),
+# so this import was broken before this refactor too. Fixed here by building
+# mu/cov locally, the same way optimal_portfolio.py's own __main__ does.
+from portfolio_optimization.correlation_matrix import (
+    ASSET_NAMES,
+    COV_METHOD,
+    compute_cov_preferred,
+    get_default_universe,
+)
 
 from portfolio_optimization.expected_returns import (
-    mu_preferred,
+    build_expected_returns,
     RF_ANNUAL,
+    VIEWS,
     WEEKS_PER_YEAR,
 )
 
 from portfolio_optimization.optimal_portfolio import (
     optimal_portfolio,
-    COV,
-    ASSET_NAMES,
     portfolio_stats,
     TARGET_RETURN_ANNUAL,
 )
@@ -265,9 +274,18 @@ def summarise(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    universe = get_default_universe()
+    cov_preferred = compute_cov_preferred(
+        universe.returns, universe.market_returns, method=COV_METHOD,
+    )
+    mu_preferred, _bl = build_expected_returns(
+        cov_preferred, ASSET_NAMES, views=VIEWS,
+    )
+
     mu_weekly = np.asarray(mu_preferred, dtype=float)
-    cov_annual = np.asarray(COV, dtype=float)
-    n_obs = len(returns)  # T: weeks of history behind the mean estimate
+    cov_annual = np.asarray(cov_preferred, dtype=float)
+    cov_annual = (cov_annual + cov_annual.T) / 2.0
+    n_obs = len(universe.returns)  # T: weeks of history behind the mean estimate
 
     print(f"\nTarget return (annualised): {TARGET_RETURN_ANNUAL:.2%}")
     print(f"Sample size T (weeks)     : {n_obs}")

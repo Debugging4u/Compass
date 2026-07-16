@@ -48,8 +48,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Stage 3 — weekly log returns + the covariance recipe (single source of truth).
-from portfolio_optimization.correlation_matrix import returns, compute_cov_preferred
+# Stage 3 — the universe loader + covariance recipe (single source of truth).
+# `returns` is no longer a module-level value (see correlation_matrix.py's
+# import-time contract) — run_backtest() fetches it via get_default_universe()
+# unless a caller passes its own returns_df.
+from portfolio_optimization.correlation_matrix import (
+    compute_cov_preferred,
+    get_default_universe,
+)
 
 # Stage 4 — Black-Litterman mu, the policy prior, and the live views.
 from portfolio_optimization.expected_returns import (
@@ -155,8 +161,14 @@ def estimate_window(window_returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarra
 # ---------------------------------------------------------------------------
 # Walk-forward engine
 # ---------------------------------------------------------------------------
-def run_backtest() -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
+def run_backtest(
+    returns_df: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     """Run the walk-forward backtest.
+
+    Args:
+        returns_df: Weekly log-return DataFrame to backtest over. Defaults to
+            `get_default_universe().returns` (the live universe) when omitted.
 
     Returns:
         weekly_returns: realised weekly SIMPLE returns per strategy (OOS only).
@@ -164,9 +176,10 @@ def run_backtest() -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
         infeasible: per-strategy count of rebalances where the target was
             unattainable and the previous weights were carried forward.
     """
-    simple = np.expm1(returns)                       # weekly log -> simple
-    dates = returns.index
-    n_weeks = len(returns)
+    returns_df = get_default_universe().returns if returns_df is None else returns_df
+
+    simple = np.expm1(returns_df)                    # weekly log -> simple
+    n_weeks = len(returns_df)
     names = list(STRATEGIES.keys())
 
     # Rebalance dates: first at MIN_TRAIN_WEEKS, then every REBAL_WEEKS, leaving
@@ -186,7 +199,7 @@ def run_backtest() -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
 
     for k, t in enumerate(rebal_idx):
         lo = 0 if WINDOW_MODE == "expanding" else t - WINDOW_WEEKS
-        window = returns.iloc[lo:t]                  # strictly before t
+        window = returns_df.iloc[lo:t]                # strictly before t
         mu_weekly, cov_np = estimate_window(window)
 
         # Build target weights for each strategy at this rebalance.

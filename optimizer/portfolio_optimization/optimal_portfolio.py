@@ -46,10 +46,16 @@ from codelib.portfolio_optimization.mean_variance import (
 )
 from codelib.visualization.layout import DefaultStyle
 
-# Stage 3 output: annualised preferred covariance (LW constant-variance) +
-# weekly returns DataFrame with named columns.
-# NOTE: requires Stage 3 to expose `cov_preferred = cov_lw_constant`.
-from portfolio_optimization.correlation_matrix import cov_preferred, returns
+# Stage 3: asset order (no I/O) + the universe loader/covariance recipe.
+# cov_preferred is no longer a module-level value (see correlation_matrix.py's
+# import-time contract) — it's built fresh inside __main__ below, and the
+# `COV` ndarray this file used to expose at module level goes with it.
+from portfolio_optimization.correlation_matrix import (
+    ASSET_NAMES,
+    COV_METHOD,
+    compute_cov_preferred,
+    get_default_universe,
+)
 
 from portfolio_optimization.expected_returns import (
     build_expected_returns,
@@ -57,17 +63,6 @@ from portfolio_optimization.expected_returns import (
     WEEKS_PER_YEAR,
     VIEWS,
 )
-
-DefaultStyle()
-
-ASSET_NAMES = list(returns.columns)
-
-# --- Convert the covariance to a plain ndarray once, here. ---------------
-# Everything downstream (cvxpy.quad_form, portfolio_std/mean) expects a
-# constant matrix. Symmetrise to clean up any tiny numerical asymmetry from
-# the shrinkage reconstruction before it reaches the solver.
-COV = np.asarray(cov_preferred, dtype=float)
-COV = (COV + COV.T) / 2.0
 
 # ---------------------------------------------------------------------------
 # Constraints (Stage 5 box constraint — acts as a regulariser, per
@@ -529,6 +524,16 @@ def plot_weight_stackplot(
 TARGET_RETURN_ANNUAL = 0.105
 
 if __name__ == "__main__":
+    DefaultStyle()
+
+    universe = get_default_universe()
+    cov_preferred = compute_cov_preferred(
+        universe.returns, universe.market_returns, method=COV_METHOD,
+    )
+    # Plain ndarray, symmetrised — everything downstream (cvxpy.quad_form,
+    # portfolio_std/mean) expects a constant matrix, not a pandas frame.
+    COV = np.asarray(cov_preferred, dtype=float)
+    COV = (COV + COV.T) / 2.0
 
     # vols are taken from COV — the SAME matrix the optimiser uses — so mu and
     # the risk model stay coherent.
