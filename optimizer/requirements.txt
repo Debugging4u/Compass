@@ -14,7 +14,7 @@ markdown-it-py==4.2.0
 matplotlib==3.10.9
 mdurl==0.1.2
 multitasking==0.0.13
-numpy==2.2.4
+numpy==2.3.3
 numpy-financial==1.0.0
 packaging==26.2
 pandas==3.0.3
