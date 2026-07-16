@@ -19,26 +19,32 @@ compass/
     portfolio_optimization/   Black-Litterman + Ledoit-Wolf + CVXPY pipeline
     codelib/                  vendored helper library (BL, mean-variance,
                                statistics, curves) the pipeline calls directly
-    api/                      placeholder for the FastAPI wrapper (not built yet)
+    api/                      FastAPI wrapper exposing the pipeline as JSON
     requirements.txt
 ```
 
-## Status: scaffold only
+## Status
 
-This repo is currently a straight move of `client/` + `server/` from Ledger
-and `portfolio_optimization/` + `codelib/` from Finance, with dead
-coursework files trimmed (`optimal_portfolio_old.py`, `codelib/week5`,
-`codelib/week6`, `codelib/week_7` — unreferenced by the pipeline). No
-integration work has happened yet:
-
-- `optimizer/` is not wired to `server/` — there's no API layer.
-- The pipeline modules (`correlation_matrix.py` and everything that imports
-  from it) still run as top-to-bottom scripts: importing any of them
-  triggers a live `yfinance` download and a blocking `plt.show()`. They need
-  to become pure, callable functions before `optimizer/api/` can wrap them.
+- The pipeline modules no longer run as top-to-bottom scripts. Importing any
+  of them does nothing (no network call, no printing, no plotting) — see
+  `correlation_matrix.py`'s `load_universe()` / `get_default_universe()`.
+  Console output and plots still happen when a stage is run directly
+  (`python -m portfolio_optimization.<stage>`), guarded behind
+  `if __name__ == "__main__":`.
+- `optimizer/api/` wraps the pipeline as a FastAPI service (`/universe`,
+  `/portfolio`, `/frontier`, `/correlation`, `/backtest`, `/refresh`).
+  `server/` proxies to it (`/api/optimizer/*`, see `OPTIMIZER_URL`) — the
+  browser never talks to the Python service directly.
+- **Not done yet:** no UI consumes these endpoints — `client/` still only
+  shows the Ledger portfolio table/watchlist/brief. That's the next piece.
 - `requirements.txt` was re-saved as UTF-8 (the Finance original was UTF-16
-  and would fail `pip install -r` as-is). Python version is not yet pinned.
+  and would fail `pip install -r` as-is); `cvxpy` was bumped from 1.3.2 to
+  1.9.2 (the pinned version didn't install against the pinned `scipy`).
+  Python version itself is still not pinned.
 - No shared database — still `localStorage` on the client, same as Ledger.
+- Dead coursework files trimmed during the move from Finance
+  (`optimal_portfolio_old.py`, `codelib/week5`, `codelib/week6`,
+  `codelib/week_7` — unreferenced by the pipeline).
 
 ## Running the dashboard (client + server)
 
@@ -68,8 +74,9 @@ cd client && npm run dev
 
 Open http://localhost:5173.
 
-## Running the optimizer (currently standalone)
+## Running the optimizer
 
+**As a CLI stage** (prints diagnostics, opens plots):
 ```bash
 cd optimizer
 python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
@@ -77,4 +84,12 @@ pip install -r requirements.txt
 python -m portfolio_optimization.optimal_portfolio    # or .backtest, .weight_sensitivity
 ```
 
-Not yet connected to the dashboard — see Status above.
+**As an API** (what `server/` proxies to):
+```bash
+cd optimizer && source .venv/bin/activate
+uvicorn api.main:app --reload --port 8000
+```
+
+With that running, `server/` (started as above) exposes it at
+`/api/optimizer/*`, e.g. `http://localhost:3001/api/optimizer/portfolio`.
+See `optimizer/api/README.md` for the full route list.

@@ -43,3 +43,5 @@ websockets==16.0
 yfinance==1.4.0
 seaborn==0.13.0
 cvxpy==1.9.2
+fastapi==0.121.2
+uvicorn==0.38.0

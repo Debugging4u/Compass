@@ -126,5 +126,39 @@ app.post("/api/market", async (req, res) => {
   res.json({ quotes, brief });
 });
 
+// ---------- Optimizer proxy ----------
+// The optimizer is a separate FastAPI service (optimizer/api/main.py). We
+// proxy specific routes rather than forwarding an arbitrary path, so the
+// Python service never has to trust anything from the request beyond query
+// params it already validates itself.
+const OPTIMIZER_URL = process.env.OPTIMIZER_URL || "http://localhost:8000";
+
+async function proxyGet(pythonPath, req, res) {
+  try {
+    const qs = new URLSearchParams(req.query).toString();
+    const r = await fetch(`${OPTIMIZER_URL}${pythonPath}${qs ? `?${qs}` : ""}`);
+    res.status(r.status).json(await r.json());
+  } catch (err) {
+    console.warn(`Optimizer proxy failed (${pythonPath}):`, err.message);
+    res.status(502).json({ error: "optimizer service unavailable" });
+  }
+}
+
+app.get("/api/optimizer/universe", (req, res) => proxyGet("/universe", req, res));
+app.get("/api/optimizer/portfolio", (req, res) => proxyGet("/portfolio", req, res));
+app.get("/api/optimizer/frontier", (req, res) => proxyGet("/frontier", req, res));
+app.get("/api/optimizer/correlation", (req, res) => proxyGet("/correlation", req, res));
+app.get("/api/optimizer/backtest", (req, res) => proxyGet("/backtest", req, res));
+
+app.post("/api/optimizer/refresh", async (req, res) => {
+  try {
+    const r = await fetch(`${OPTIMIZER_URL}/refresh`, { method: "POST" });
+    res.status(r.status).json(await r.json());
+  } catch (err) {
+    console.warn("Optimizer refresh failed:", err.message);
+    res.status(502).json({ error: "optimizer service unavailable" });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Ledger server running on :${PORT}`));
