@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { RefreshCw, Plus, X, TrendingUp, TrendingDown, Eye, Briefcase, AlertCircle } from "lucide-react";
+import Optimizer from "./Optimizer";
 
 // ---------- helpers ----------
 const uid = () => Math.random().toString(36).slice(2, 9);
@@ -280,6 +281,8 @@ export default function App() {
         )}
         <AddTicker onAdd={(t) => setWatchlist((s) => [...s, { id: uid(), ticker: t }])} />
       </section>
+
+      <Optimizer />
 
       <footer className="ft">
         Prices are indicative and may be delayed — pulled live from the web, not an exchange feed. The Portfolio total
