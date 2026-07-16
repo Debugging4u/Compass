@@ -46,7 +46,7 @@ from portfolio_optimization.optimal_portfolio import (
     constrained_max_sharpe,
     optimal_portfolio,
 )
-from portfolio_optimization.backtest import performance_table, run_backtest
+from portfolio_optimization.backtest import build_strategies, performance_table, run_backtest
 
 app = FastAPI(title="Compass Optimizer API", version="0.1.0")
 
@@ -185,9 +185,16 @@ def correlation():
 
 
 @app.get("/backtest")
-def backtest():
+def backtest(
+    target_return: float = Query(
+        TARGET_RETURN_ANNUAL,
+        description="Annualised target return for the backtest's 'Target X%' strategy",
+    ),
+):
     try:
-        weekly_returns, equity, infeasible = run_backtest()
+        weekly_returns, equity, infeasible = run_backtest(
+            strategies=build_strategies(target_return_annual=target_return),
+        )
     except SystemExit as exc:
         # run_backtest() raises SystemExit when there isn't enough history for
         # a single rebalance — a config problem, not a server error.

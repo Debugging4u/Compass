@@ -118,17 +118,29 @@ def _w_max_sharpe(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
     return constrained_max_sharpe(mu_weekly, cov_np, RF_ANNUAL)
 
 
-def _w_target(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
-    return optimal_portfolio(mu_weekly, cov_np, TARGET_RETURN_ANNUAL)
+def build_strategies(target_return_annual: float = TARGET_RETURN_ANNUAL) -> dict[str, callable]:
+    """Build the strategy dict for a given target return.
+
+    A function rather than a module-level constant so callers (the API layer
+    included) can backtest a different target without touching the pipeline's
+    TARGET_RETURN_ANNUAL default — the label is derived from whatever target
+    is actually passed in, so it never drifts out of sync with the number.
+    """
+    def _w_target(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
+        return optimal_portfolio(mu_weekly, cov_np, target_return_annual)
+
+    return {
+        "1/N (equal)": _w_equal,
+        "Strategic (prior)": _w_strategic,
+        "GMV": _w_gmv,
+        "Max Sharpe": _w_max_sharpe,
+        f"Target {target_return_annual:.0%}": _w_target,
+    }
 
 
-STRATEGIES: dict[str, callable] = {
-    "1/N (equal)": _w_equal,
-    "Strategic (prior)": _w_strategic,
-    "GMV": _w_gmv,
-    "Max Sharpe": _w_max_sharpe,
-    f"Target {TARGET_RETURN_ANNUAL:.0%}": _w_target,
-}
+# Default strategy set, at the pipeline's own TARGET_RETURN_ANNUAL — what
+# run_backtest() uses unless a caller asks for a different target.
+STRATEGIES: dict[str, callable] = build_strategies()
 
 
 # ---------------------------------------------------------------------------
@@ -163,12 +175,18 @@ def estimate_window(window_returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarra
 # ---------------------------------------------------------------------------
 def run_backtest(
     returns_df: pd.DataFrame | None = None,
+    strategies: dict[str, callable] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     """Run the walk-forward backtest.
 
     Args:
         returns_df: Weekly log-return DataFrame to backtest over. Defaults to
             `get_default_universe().returns` (the live universe) when omitted.
+        strategies: Strategy dict to test, as built by `build_strategies()`.
+            Defaults to the module-level `STRATEGIES` (target = the pipeline's
+            own TARGET_RETURN_ANNUAL) when omitted — pass
+            `build_strategies(target_return_annual=...)` to backtest a
+            different target.
 
     Returns:
         weekly_returns: realised weekly SIMPLE returns per strategy (OOS only).
@@ -177,10 +195,11 @@ def run_backtest(
             unattainable and the previous weights were carried forward.
     """
     returns_df = get_default_universe().returns if returns_df is None else returns_df
+    strategies = STRATEGIES if strategies is None else strategies
 
     simple = np.expm1(returns_df)                    # weekly log -> simple
     n_weeks = len(returns_df)
-    names = list(STRATEGIES.keys())
+    names = list(strategies.keys())
 
     # Rebalance dates: first at MIN_TRAIN_WEEKS, then every REBAL_WEEKS, leaving
     # at least one forward week to realise.
@@ -204,7 +223,7 @@ def run_backtest(
 
         # Build target weights for each strategy at this rebalance.
         weights_now: dict[str, np.ndarray] = {}
-        for nm, builder in STRATEGIES.items():
+        for nm, builder in strategies.items():
             try:
                 w = builder(mu_weekly, cov_np)
             except ValueError:                       # target unattainable this window

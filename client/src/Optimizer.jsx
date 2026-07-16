@@ -45,23 +45,27 @@ export default function Optimizer() {
     loadPortfolio(DEFAULT_TARGET_PCT);
   }, [loadPortfolio]);
 
-  const applyTarget = () => {
-    const pct = parseFloat(targetInput);
-    if (isNaN(pct)) return;
-    setTargetPct(pct);
-    loadPortfolio(pct);
-  };
-
-  const runBacktest = async () => {
+  const runBacktest = useCallback(async (pct) => {
     setBtLoading(true);
     setError("");
     try {
-      setBacktestData(await getJSON("/api/optimizer/backtest"));
+      setBacktestData(await getJSON(`/api/optimizer/backtest?target_return=${pct / 100}`));
     } catch (e) {
       setError(e.message || "Backtest failed.");
     } finally {
       setBtLoading(false);
     }
+  }, []);
+
+  const applyTarget = () => {
+    const pct = parseFloat(targetInput);
+    if (isNaN(pct)) return;
+    setTargetPct(pct);
+    loadPortfolio(pct);
+    // Keep the backtest in sync with the target control, same as the
+    // portfolio/frontier above it — but only if it's already been run once;
+    // it stays on-demand otherwise (it's the expensive call).
+    if (backtestData) runBacktest(pct);
   };
 
   const assetNames = portfolioData ? Object.keys(portfolioData.mu_weekly) : [];
@@ -152,7 +156,7 @@ export default function Optimizer() {
           <div className="opt-backtest">
             <div className="opt-backtest-head">
               <h3>Walk-forward backtest</h3>
-              <button className="add-btn" onClick={runBacktest} disabled={btLoading}>
+              <button className="add-btn" onClick={() => runBacktest(targetPct)} disabled={btLoading}>
                 {btLoading ? "Running…" : "Run backtest"}
               </button>
             </div>
