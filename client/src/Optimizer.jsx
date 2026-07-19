@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { Compass, RefreshCw, AlertCircle } from "lucide-react";
+import { Compass, RefreshCw, AlertCircle, ChevronDown, ChevronRight, RotateCcw } from "lucide-react";
 import { WeightBars, FrontierChart, EquityChart, colorMap } from "./charts";
 
 const DEFAULT_TARGET_PCT = 10.5; // matches optimizer/portfolio_optimization TARGET_RETURN_ANNUAL
@@ -15,7 +15,35 @@ async function getJSON(path) {
   return body;
 }
 
+async function postJSON(path, payload) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || `Request failed (${res.status})`);
+  return body;
+}
+
+// Strings -> numbers, or null if anything doesn't parse (caller shows an error
+// rather than silently sending NaN, which JSON.stringify turns into `null`).
+function parseWeights(weightsInput) {
+  const out = {};
+  for (const [name, v] of Object.entries(weightsInput)) {
+    const n = parseFloat(v);
+    if (isNaN(n)) return null;
+    out[name] = n;
+  }
+  return out;
+}
+
 export default function Optimizer() {
+  const [assetNames, setAssetNames] = useState([]);
+  const [defaultWeights, setDefaultWeights] = useState(null);
+  const [weightsInput, setWeightsInput] = useState({});
+  const [showWeights, setShowWeights] = useState(false);
+
   const [portfolioData, setPortfolioData] = useState(null);
   const [frontierData, setFrontierData] = useState(null);
   const [backtestData, setBacktestData] = useState(null);
@@ -28,13 +56,17 @@ export default function Optimizer() {
   const [btLoading, setBtLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const loadPortfolio = useCallback(async (pct, rf) => {
+  const loadPortfolio = useCallback(async (pct, rf, weights) => {
     setLoading(true);
     setError("");
     try {
       const [p, f] = await Promise.all([
-        getJSON(`/api/optimizer/portfolio?target_return=${pct / 100}&rf_annual=${rf / 100}`),
-        getJSON(`/api/optimizer/frontier?n_points=60&rf_annual=${rf / 100}`),
+        postJSON("/api/optimizer/portfolio", {
+          target_return: pct / 100, rf_annual: rf / 100, strategic_weights: weights,
+        }),
+        postJSON("/api/optimizer/frontier", {
+          n_points: 60, rf_annual: rf / 100, strategic_weights: weights,
+        }),
       ]);
       setPortfolioData(p);
       setFrontierData(f);
@@ -45,18 +77,32 @@ export default function Optimizer() {
     }
   }, []);
 
+  // On mount: fetch the universe (asset order + the pipeline's default policy
+  // weights, to pre-populate the editor), then load the portfolio/frontier.
   useEffect(() => {
-    loadPortfolio(DEFAULT_TARGET_PCT, DEFAULT_RF_PCT);
+    (async () => {
+      try {
+        const u = await getJSON("/api/optimizer/universe");
+        setAssetNames(u.asset_names);
+        setDefaultWeights(u.strategic_weights);
+        const inputs = {};
+        for (const name of u.asset_names) inputs[name] = String(u.strategic_weights[name]);
+        setWeightsInput(inputs);
+        await loadPortfolio(DEFAULT_TARGET_PCT, DEFAULT_RF_PCT, u.strategic_weights);
+      } catch (e) {
+        setError(e.message || "Couldn't reach the optimizer service.");
+      }
+    })();
   }, [loadPortfolio]);
 
-  const runBacktest = useCallback(async (pct, rf, neutral) => {
+  const runBacktest = useCallback(async (pct, rf, neutral, weights) => {
     setBtLoading(true);
     setError("");
     try {
       setBacktestData(
-        await getJSON(
-          `/api/optimizer/backtest?target_return=${pct / 100}&rf_annual=${rf / 100}&neutral_prior=${neutral}`,
-        ),
+        await postJSON("/api/optimizer/backtest", {
+          target_return: pct / 100, rf_annual: rf / 100, neutral_prior: neutral, strategic_weights: weights,
+        }),
       );
     } catch (e) {
       setError(e.message || "Backtest failed.");
@@ -68,22 +114,38 @@ export default function Optimizer() {
   const applyControls = () => {
     const pct = parseFloat(targetInput);
     const rf = parseFloat(rfInput);
+    const weights = parseWeights(weightsInput);
     if (isNaN(pct) || isNaN(rf)) return;
+    if (!weights) {
+      setError("Strategic weights must all be numbers.");
+      return;
+    }
     setTargetPct(pct);
     setRfPct(rf);
-    loadPortfolio(pct, rf);
+    loadPortfolio(pct, rf, weights);
     // Keep the backtest in sync with these controls, same as the
     // portfolio/frontier above it — but only if it's already been run once;
     // it stays on-demand otherwise (it's the expensive call).
-    if (backtestData) runBacktest(pct, rf, neutralPrior);
+    if (backtestData) runBacktest(pct, rf, neutralPrior, weights);
   };
 
   const toggleNeutralPrior = (checked) => {
     setNeutralPrior(checked);
-    if (backtestData) runBacktest(targetPct, rfPct, checked);
+    if (backtestData) {
+      const weights = parseWeights(weightsInput);
+      if (weights) runBacktest(targetPct, rfPct, checked, weights);
+    }
   };
 
-  const assetNames = portfolioData ? Object.keys(portfolioData.mu_weekly) : [];
+  const resetWeights = () => {
+    if (!defaultWeights) return;
+    const inputs = {};
+    for (const name of assetNames) inputs[name] = String(defaultWeights[name]);
+    setWeightsInput(inputs);
+    loadPortfolio(targetPct, rfPct, defaultWeights);
+    if (backtestData) runBacktest(targetPct, rfPct, neutralPrior, defaultWeights);
+  };
+
   const assetColors = colorMap(assetNames);
   const activePortfolios = portfolioData
     ? ["gmv", "max_sharpe", "target"].map((k) => portfolioData.portfolios[k]).filter(Boolean)
@@ -91,6 +153,8 @@ export default function Optimizer() {
   const maxWeight = activePortfolios.length
     ? Math.max(0.01, ...activePortfolios.flatMap((p) => Object.values(p.weights)))
     : 0.01;
+
+  const weightsSum = Object.values(weightsInput).reduce((s, v) => s + (parseFloat(v) || 0), 0);
 
   return (
     <section className="block">
@@ -128,6 +192,53 @@ export default function Optimizer() {
           </button>
         </div>
       </div>
+
+      {assetNames.length > 0 && (
+        <div className="weights-block">
+          <button className="weights-toggle" onClick={() => setShowWeights((v) => !v)}>
+            {showWeights ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            Policy weights (Black-Litterman equilibrium prior)
+          </button>
+          {showWeights && (
+            <div className="weights-editor">
+              <p className="weights-help">
+                Relative sizes for the BL equilibrium prior — the neutral, opinion-free
+                reference every view tilts away from. Don't need to sum to 100, only
+                relative proportions matter. This is the single most consequential input
+                to the model, more so than any individual view.
+              </p>
+              <div className="weights-rows">
+                {assetNames.map((name) => {
+                  const v = parseFloat(weightsInput[name]);
+                  const pct = weightsSum > 0 && !isNaN(v) ? (v / weightsSum) * 100 : 0;
+                  return (
+                    <div className="weights-row" key={name}>
+                      <span className="weights-swatch" style={{ background: assetColors[name] }} />
+                      <span className="weights-label">{name}</span>
+                      <input
+                        className="in sm"
+                        inputMode="decimal"
+                        value={weightsInput[name] ?? ""}
+                        onChange={(e) =>
+                          setWeightsInput((w) => ({ ...w, [name]: e.target.value }))
+                        }
+                        onKeyDown={(e) => e.key === "Enter" && applyControls()}
+                      />
+                      <span className="weights-pct mono">{pct.toFixed(1)}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="weights-actions">
+                <button className="link-btn" onClick={resetWeights}>
+                  <RotateCcw size={12} /> Reset to defaults
+                </button>
+                <span className="weights-hint">Edit values above, then Recalculate.</span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {error && <div className="err"><AlertCircle size={15} /> {error}</div>}
 
@@ -196,7 +307,10 @@ export default function Optimizer() {
                 </label>
                 <button
                   className="add-btn"
-                  onClick={() => runBacktest(targetPct, rfPct, neutralPrior)}
+                  onClick={() => {
+                    const weights = parseWeights(weightsInput);
+                    if (weights) runBacktest(targetPct, rfPct, neutralPrior, weights);
+                  }}
                   disabled={btLoading}
                 >
                   {btLoading ? "Running…" : "Run backtest"}
@@ -221,10 +335,10 @@ export default function Optimizer() {
                     </>
                   ) : (
                     <>
-                      <strong>Live prior.</strong> Every rebalance used your current
-                      STRATEGIC_WEIGHTS + VIEWS, even on historical windows — so Max Sharpe and
-                      Target here are partly a test of beliefs formed with full-sample hindsight,
-                      not just the machinery. GMV, 1/N and Strategic don't depend on mu, so they're
+                      <strong>Live prior.</strong> Every rebalance used your current policy
+                      weights + VIEWS, even on historical windows — so Max Sharpe and Target
+                      here are partly a test of beliefs formed with full-sample hindsight, not
+                      just the machinery. GMV, 1/N and Strategic don't depend on mu, so they're
                       identical either way — toggle "Neutral prior" to isolate the rest.
                     </>
                   )}
@@ -269,6 +383,23 @@ const css = `
 .pct-sign{color:var(--muted);}
 
 code{font-family:'IBM Plex Mono',monospace; font-size:12px; background:var(--panel); padding:1px 5px; border-radius:2px;}
+
+.weights-block{margin-top:14px;}
+.weights-toggle{display:inline-flex; align-items:center; gap:6px; background:none; border:none; cursor:pointer;
+  color:var(--accent); font-size:12.5px; font-weight:500; padding:4px 0;}
+.weights-editor{margin-top:8px; padding:14px 16px; background:var(--panel); border:1px solid var(--line); border-radius:3px;}
+.weights-help{font-size:12px; color:var(--muted); line-height:1.55; margin:0 0 12px;}
+.weights-rows{display:flex; flex-direction:column; gap:7px;}
+.weights-row{display:grid; grid-template-columns:10px 88px 90px 50px; align-items:center; gap:9px;}
+.weights-swatch{width:10px; height:10px; border-radius:2px;}
+.weights-label{font-size:12px; color:var(--ink);}
+.weights-row .in.sm{padding:6px 8px; font-size:12.5px;}
+.weights-pct{font-size:11px; color:var(--muted);}
+.weights-actions{display:flex; align-items:center; gap:12px; margin-top:12px; padding-top:12px; border-top:1px solid var(--line);}
+.link-btn{display:inline-flex; align-items:center; gap:5px; background:none; border:none; color:var(--accent);
+  font-size:12px; font-weight:500; cursor:pointer; padding:0;}
+.link-btn:hover{opacity:.8;}
+.weights-hint{font-size:11.5px; color:var(--muted); font-style:italic;}
 
 .opt-cards{display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr)); gap:14px; margin-top:6px;}
 .opt-card{background:var(--panel); border:1px solid var(--line); border-radius:3px; padding:14px 16px;}

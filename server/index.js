@@ -144,11 +144,25 @@ async function proxyGet(pythonPath, req, res) {
   }
 }
 
+async function proxyPost(pythonPath, req, res) {
+  try {
+    const r = await fetch(`${OPTIMIZER_URL}${pythonPath}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req.body ?? {}),
+    });
+    res.status(r.status).json(await r.json());
+  } catch (err) {
+    console.warn(`Optimizer proxy failed (${pythonPath}):`, err.message);
+    res.status(502).json({ error: "optimizer service unavailable" });
+  }
+}
+
 app.get("/api/optimizer/universe", (req, res) => proxyGet("/universe", req, res));
-app.get("/api/optimizer/portfolio", (req, res) => proxyGet("/portfolio", req, res));
-app.get("/api/optimizer/frontier", (req, res) => proxyGet("/frontier", req, res));
 app.get("/api/optimizer/correlation", (req, res) => proxyGet("/correlation", req, res));
-app.get("/api/optimizer/backtest", (req, res) => proxyGet("/backtest", req, res));
+app.post("/api/optimizer/portfolio", (req, res) => proxyPost("/portfolio", req, res));
+app.post("/api/optimizer/frontier", (req, res) => proxyPost("/frontier", req, res));
+app.post("/api/optimizer/backtest", (req, res) => proxyPost("/backtest", req, res));
 
 app.post("/api/optimizer/refresh", async (req, res) => {
   try {

@@ -210,7 +210,8 @@ def build_reference_weights(
     weights = np.array([strategic_weights[name] for name in asset_names], dtype=float)
     if np.any(weights <= 0) or weights.sum() <= 0:
         raise ValueError(
-            f"Strategic weights must be positive; got {dict(zip(asset_names, weights))}."
+            f"Strategic weights must be positive; got "
+            f"{dict(zip(asset_names, (float(w) for w in weights)))}."
         )
 
     return weights / weights.sum()

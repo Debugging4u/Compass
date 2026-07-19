@@ -8,6 +8,10 @@ correlation_matrix.py / expected_returns.py / optimal_portfolio.py /
 backtest.py) — no logic is duplicated here, this file only shapes their
 outputs into JSON.
 
+/portfolio, /frontier, /backtest take a JSON body (not query params) because
+they accept strategic_weights, a per-asset dict — the same shape VIEWS will
+need when that's wired in next, so this is the contract both will share.
+
 No auth, no database, no rate limiting: this mirrors the pipeline's current
 single-user, personal-tool scope. Add auth before exposing this beyond
 localhost / a trusted server-side caller.
@@ -19,7 +23,8 @@ Run from optimizer/ with the venv active:
 from __future__ import annotations
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 from codelib.portfolio_optimization.mean_variance import portfolio_mean, portfolio_std
 from codelib.statistics.moments import cov_to_corr_matrix
@@ -34,9 +39,11 @@ from portfolio_optimization.correlation_matrix import (
 )
 from portfolio_optimization.expected_returns import (
     RF_ANNUAL,
+    STRATEGIC_WEIGHTS,
     VIEWS,
     WEEKS_PER_YEAR,
     build_expected_returns,
+    build_reference_weights,
 )
 from portfolio_optimization.optimal_portfolio import (
     MAX_WEIGHT,
@@ -52,16 +59,56 @@ app = FastAPI(title="Compass Optimizer API", version="0.1.0")
 
 
 # ---------------------------------------------------------------------------
+# Request bodies
+# ---------------------------------------------------------------------------
+
+class PortfolioRequest(BaseModel):
+    target_return: float = TARGET_RETURN_ANNUAL
+    rf_annual: float = RF_ANNUAL
+    strategic_weights: dict[str, float] | None = None  # None = pipeline default
+
+
+class FrontierRequest(BaseModel):
+    n_points: int = Field(50, ge=5, le=500)
+    rf_annual: float = RF_ANNUAL
+    strategic_weights: dict[str, float] | None = None
+
+
+class BacktestRequest(BaseModel):
+    target_return: float = TARGET_RETURN_ANNUAL
+    rf_annual: float = RF_ANNUAL
+    neutral_prior: bool = False
+    strategic_weights: dict[str, float] | None = None
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _cov_and_mu(rf_annual: float = RF_ANNUAL) -> tuple[np.ndarray, np.ndarray]:
+def _resolve_strategic_weights(sw: dict[str, float] | None) -> dict[str, float]:
+    """Fall back to the pipeline default, and validate against ASSET_NAMES.
+
+    Centralised here so every route validates the same way, once, up front —
+    letting an invalid dict reach `run_backtest()` would otherwise fail
+    silently per-rebalance (caught as "infeasible" and papered over with
+    carried-forward weights) instead of failing loudly as a bad request.
+
+    Raises:
+        HTTPException: 400, if weights are missing an asset or non-positive.
+    """
+    resolved = STRATEGIC_WEIGHTS if sw is None else sw
+    try:
+        build_reference_weights(ASSET_NAMES, resolved)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return resolved
+
+
+def _cov_and_mu(rf_annual: float, strategic_weights: dict[str, float]) -> tuple[np.ndarray, np.ndarray]:
     """Fresh (cov_annual, mu_weekly) off the current default universe.
 
-    Args:
-        rf_annual: Annual risk-free rate — feeds the BL excess/total
-            conversion, so it shifts where mu (and everything downstream)
-            sits, not just the Sharpe ratios computed from it.
+    Callers must resolve/validate `strategic_weights` first (see
+    `_resolve_strategic_weights`) — this function assumes it's already valid.
 
     Raises:
         HTTPException: 502, if the universe can't be loaded (e.g. the price
@@ -73,7 +120,9 @@ def _cov_and_mu(rf_annual: float = RF_ANNUAL) -> tuple[np.ndarray, np.ndarray]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     cov_df = compute_cov_preferred(universe.returns, universe.market_returns, method=COV_METHOD)
-    mu_weekly, _bl = build_expected_returns(cov_df, ASSET_NAMES, views=VIEWS, rf_annual=rf_annual)
+    mu_weekly, _bl = build_expected_returns(
+        cov_df, ASSET_NAMES, views=VIEWS, rf_annual=rf_annual, strategic_weights=strategic_weights,
+    )
 
     cov = np.asarray(cov_df, dtype=float)
     cov = (cov + cov.T) / 2.0
@@ -110,8 +159,18 @@ def health():
 
 @app.get("/universe")
 def universe():
-    """Static universe config — no network call, safe to poll freely."""
-    return {"asset_names": ASSET_NAMES, "tickers": tickers, "max_weight": MAX_WEIGHT}
+    """Static universe config — no network call, safe to poll freely.
+
+    strategic_weights here is the pipeline's DEFAULT — the value to
+    pre-populate a weights editor with, not necessarily what the last
+    /portfolio call used (that's echoed back on each response instead).
+    """
+    return {
+        "asset_names": ASSET_NAMES,
+        "tickers": tickers,
+        "max_weight": MAX_WEIGHT,
+        "strategic_weights": STRATEGIC_WEIGHTS,
+    }
 
 
 @app.post("/refresh")
@@ -130,52 +189,42 @@ def refresh():
     }
 
 
-@app.get("/portfolio")
-def portfolio(
-    target_return: float = Query(
-        TARGET_RETURN_ANNUAL,
-        description="Annualised target return for the target-return portfolio",
-    ),
-    rf_annual: float = Query(
-        RF_ANNUAL,
-        description="Annualised risk-free rate — affects mu (BL excess/total "
-        "conversion) and every Sharpe ratio, not just the Max Sharpe portfolio",
-    ),
-):
-    cov, mu_weekly = _cov_and_mu(rf_annual)
+@app.post("/portfolio")
+def portfolio(req: PortfolioRequest):
+    sw = _resolve_strategic_weights(req.strategic_weights)
+    cov, mu_weekly = _cov_and_mu(req.rf_annual, sw)
 
     w_gmv = constrained_gmv(mu_weekly, cov)
-    w_ms = constrained_max_sharpe(mu_weekly, cov, rf_annual)
+    w_ms = constrained_max_sharpe(mu_weekly, cov, req.rf_annual)
 
     target_summary, target_error = None, None
     try:
-        w_target = optimal_portfolio(mu_weekly, cov, target_return)
-        target_summary = _portfolio_summary(w_target, mu_weekly, cov, rf_annual)
+        w_target = optimal_portfolio(mu_weekly, cov, req.target_return)
+        target_summary = _portfolio_summary(w_target, mu_weekly, cov, req.rf_annual)
     except (ValueError, RuntimeError) as exc:
         target_error = str(exc)
 
     return {
-        "rf_annual": rf_annual,
-        "target_return_annual": target_return,
+        "rf_annual": req.rf_annual,
+        "target_return_annual": req.target_return,
+        "strategic_weights": sw,
         "mu_weekly": _weight_dict(mu_weekly),
         "mu_annual": _weight_dict(mu_weekly * WEEKS_PER_YEAR),
         "covariance_condition_number": float(np.linalg.cond(cov)),
         "portfolios": {
-            "gmv": _portfolio_summary(w_gmv, mu_weekly, cov, rf_annual),
-            "max_sharpe": _portfolio_summary(w_ms, mu_weekly, cov, rf_annual),
+            "gmv": _portfolio_summary(w_gmv, mu_weekly, cov, req.rf_annual),
+            "max_sharpe": _portfolio_summary(w_ms, mu_weekly, cov, req.rf_annual),
             "target": target_summary,
         },
         "target_error": target_error,
     }
 
 
-@app.get("/frontier")
-def frontier(
-    n_points: int = Query(50, ge=5, le=500),
-    rf_annual: float = Query(RF_ANNUAL, description="Annualised risk-free rate"),
-):
-    cov, mu_weekly = _cov_and_mu(rf_annual)
-    mu_f, std_f, w_f = compute_constrained_frontier(mu_weekly, cov, n_points=n_points)
+@app.post("/frontier")
+def frontier(req: FrontierRequest):
+    sw = _resolve_strategic_weights(req.strategic_weights)
+    cov, mu_weekly = _cov_and_mu(req.rf_annual, sw)
+    mu_f, std_f, w_f = compute_constrained_frontier(mu_weekly, cov, n_points=req.n_points)
     points = [
         {"return_annual": float(r), "vol_annual": float(s), "weights": _weight_dict(w)}
         for r, s, w in zip(mu_f, std_f, w_f)
@@ -199,34 +248,24 @@ def correlation():
     }
 
 
-@app.get("/backtest")
-def backtest(
-    target_return: float = Query(
-        TARGET_RETURN_ANNUAL,
-        description="Annualised target return for the backtest's 'Target X%' strategy",
-    ),
-    rf_annual: float = Query(RF_ANNUAL, description="Annualised risk-free rate"),
-    neutral_prior: bool = Query(
-        False,
-        description="If true, each rebalance re-estimates mu with an equal-weight "
-        "prior and no views — tests the shrinkage + optimisation machinery in "
-        "isolation. If false (default), uses the live STRATEGIC_WEIGHTS + VIEWS "
-        "at every historical rebalance, which is partly a backtest of beliefs "
-        "formed with full-sample hindsight, not just the machinery.",
-    ),
-):
+@app.post("/backtest")
+def backtest(req: BacktestRequest):
+    sw = _resolve_strategic_weights(req.strategic_weights)
     try:
         weekly_returns, equity, infeasible = run_backtest(
-            strategies=build_strategies(target_return_annual=target_return, rf_annual=rf_annual),
-            rf_annual=rf_annual,
-            neutral_prior=neutral_prior,
+            strategies=build_strategies(
+                target_return_annual=req.target_return, rf_annual=req.rf_annual, strategic_weights=sw,
+            ),
+            rf_annual=req.rf_annual,
+            neutral_prior=req.neutral_prior,
+            strategic_weights=sw,
         )
     except SystemExit as exc:
         # run_backtest() raises SystemExit when there isn't enough history for
         # a single rebalance — a config problem, not a server error.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    table = performance_table(weekly_returns, rf_annual=rf_annual)
+    table = performance_table(weekly_returns, rf_annual=req.rf_annual)
     return {
         "performance": table.to_dict(orient="index"),
         "equity_curves": {
@@ -235,6 +274,7 @@ def backtest(
         },
         "infeasible": infeasible,
         "oos_weeks": len(weekly_returns),
-        "rf_annual": rf_annual,
-        "neutral_prior": neutral_prior,
+        "rf_annual": req.rf_annual,
+        "neutral_prior": req.neutral_prior,
+        "strategic_weights": sw,
     }
