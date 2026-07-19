@@ -114,20 +114,22 @@ def _w_gmv(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
     return constrained_gmv(mu_weekly, cov_np)
 
 
-def _w_max_sharpe(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
-    return constrained_max_sharpe(mu_weekly, cov_np, RF_ANNUAL)
-
-
-def build_strategies(target_return_annual: float = TARGET_RETURN_ANNUAL) -> dict[str, callable]:
-    """Build the strategy dict for a given target return.
+def build_strategies(
+    target_return_annual: float = TARGET_RETURN_ANNUAL,
+    rf_annual: float = RF_ANNUAL,
+) -> dict[str, callable]:
+    """Build the strategy dict for a given target return and risk-free rate.
 
     A function rather than a module-level constant so callers (the API layer
-    included) can backtest a different target without touching the pipeline's
-    TARGET_RETURN_ANNUAL default — the label is derived from whatever target
-    is actually passed in, so it never drifts out of sync with the number.
+    included) can backtest a different target/rf without touching the
+    pipeline's own defaults — labels are derived from whatever is actually
+    passed in, so they never drift out of sync with the numbers used.
     """
     def _w_target(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
         return optimal_portfolio(mu_weekly, cov_np, target_return_annual)
+
+    def _w_max_sharpe(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
+        return constrained_max_sharpe(mu_weekly, cov_np, rf_annual)
 
     return {
         "1/N (equal)": _w_equal,
@@ -146,16 +148,29 @@ STRATEGIES: dict[str, callable] = build_strategies()
 # ---------------------------------------------------------------------------
 # Per-window estimation: reproduce the live pipeline on a returns slice.
 # ---------------------------------------------------------------------------
-def estimate_window(window_returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+def estimate_window(
+    window_returns: pd.DataFrame,
+    rf_annual: float = RF_ANNUAL,
+    neutral_prior: bool = NEUTRAL_PRIOR,
+) -> tuple[np.ndarray, np.ndarray]:
     """Re-estimate (mu_weekly, cov_annual_np) on a trailing returns window.
 
     Uses the exact Stage 3 covariance recipe and the exact Stage 4 BL build, so
     the walk-forward sees the same inputs the live model would have seen had it
     been run on that date.
+
+    Args:
+        window_returns: Trailing weekly log-return slice, strictly before the
+            rebalance date (no look-ahead).
+        rf_annual: Annual risk-free rate for the excess/total conversion.
+        neutral_prior: If True, use an equal-weight prior and no views — tests
+            the shrinkage + optimisation machinery in isolation. If False
+            (default), uses the live STRATEGIC_WEIGHTS prior and VIEWS, which
+            is partly a test of hindsight beliefs (see module docstring).
     """
     cov_df = compute_cov_preferred(window_returns)                  # Stage 3
 
-    if NEUTRAL_PRIOR:
+    if neutral_prior:
         sw, views = None, []                       # equal-weight prior, no views
     else:
         sw, views = STRATEGIC_WEIGHTS, VIEWS       # live policy prior + views
@@ -164,6 +179,7 @@ def estimate_window(window_returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarra
         cov_df, ASSET_NAMES,
         strategic_weights=sw,
         views=views,
+        rf_annual=rf_annual,
     )
     cov_np = np.asarray(cov_df.reindex(index=ASSET_NAMES, columns=ASSET_NAMES), float)
     cov_np = (cov_np + cov_np.T) / 2.0
@@ -176,6 +192,8 @@ def estimate_window(window_returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarra
 def run_backtest(
     returns_df: pd.DataFrame | None = None,
     strategies: dict[str, callable] | None = None,
+    rf_annual: float = RF_ANNUAL,
+    neutral_prior: bool = NEUTRAL_PRIOR,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     """Run the walk-forward backtest.
 
@@ -184,9 +202,20 @@ def run_backtest(
             `get_default_universe().returns` (the live universe) when omitted.
         strategies: Strategy dict to test, as built by `build_strategies()`.
             Defaults to the module-level `STRATEGIES` (target = the pipeline's
-            own TARGET_RETURN_ANNUAL) when omitted — pass
-            `build_strategies(target_return_annual=...)` to backtest a
-            different target.
+            own TARGET_RETURN_ANNUAL, rf = RF_ANNUAL) when omitted — pass
+            `build_strategies(target_return_annual=..., rf_annual=...)` to
+            backtest a different target/rf. NOTE: if you pass a custom
+            `rf_annual` here, pass the SAME value to `build_strategies()` —
+            they aren't linked automatically, since a strategy dict can be
+            reused across calls.
+        rf_annual: Annual risk-free rate used to re-estimate mu at each
+            rebalance (see `estimate_window`).
+        neutral_prior: If True, each window's mu is estimated with an
+            equal-weight prior and no views — tests the optimisation
+            machinery in isolation, uncontaminated by hindsight. If False
+            (default), uses the live STRATEGIC_WEIGHTS + VIEWS at every
+            historical rebalance, which is partly a backtest of beliefs
+            formed with full-sample hindsight — see module docstring.
 
     Returns:
         weekly_returns: realised weekly SIMPLE returns per strategy (OOS only).
@@ -219,7 +248,7 @@ def run_backtest(
     for k, t in enumerate(rebal_idx):
         lo = 0 if WINDOW_MODE == "expanding" else t - WINDOW_WEEKS
         window = returns_df.iloc[lo:t]                # strictly before t
-        mu_weekly, cov_np = estimate_window(window)
+        mu_weekly, cov_np = estimate_window(window, rf_annual=rf_annual, neutral_prior=neutral_prior)
 
         # Build target weights for each strategy at this rebalance.
         weights_now: dict[str, np.ndarray] = {}
@@ -252,7 +281,7 @@ def run_backtest(
 # ---------------------------------------------------------------------------
 # Realised performance statistics
 # ---------------------------------------------------------------------------
-def performance_table(weekly_returns: pd.DataFrame) -> pd.DataFrame:
+def performance_table(weekly_returns: pd.DataFrame, rf_annual: float = RF_ANNUAL) -> pd.DataFrame:
     """Annualised realised stats per strategy from weekly SIMPLE returns."""
     out = {}
     for nm in weekly_returns.columns:
@@ -261,7 +290,7 @@ def performance_table(weekly_returns: pd.DataFrame) -> pd.DataFrame:
         growth = float(np.prod(1.0 + r))
         ann_ret = growth ** (WEEKS_PER_YEAR / n) - 1.0 if n > 0 else np.nan
         ann_vol = float(np.std(r, ddof=1)) * np.sqrt(WEEKS_PER_YEAR) if n > 1 else np.nan
-        sharpe = (ann_ret - RF_ANNUAL) / ann_vol if ann_vol and ann_vol > 1e-12 else np.nan
+        sharpe = (ann_ret - rf_annual) / ann_vol if ann_vol and ann_vol > 1e-12 else np.nan
         curve = np.cumprod(1.0 + r)
         peak = np.maximum.accumulate(curve)
         max_dd = float(np.min(curve / peak - 1.0)) if n > 0 else np.nan

@@ -3,6 +3,7 @@ import { Compass, RefreshCw, AlertCircle } from "lucide-react";
 import { WeightBars, FrontierChart, EquityChart, colorMap } from "./charts";
 
 const DEFAULT_TARGET_PCT = 10.5; // matches optimizer/portfolio_optimization TARGET_RETURN_ANNUAL
+const DEFAULT_RF_PCT = 4.0;      // matches optimizer/portfolio_optimization RF_ANNUAL
 
 const PORTFOLIO_LABEL = { gmv: "Min. variance (GMV)", max_sharpe: "Max Sharpe" };
 const PORTFOLIO_MARKER_COLOR = { gmv: "#2a78d6", max_sharpe: "#008300", target: "#eb6834" };
@@ -20,17 +21,20 @@ export default function Optimizer() {
   const [backtestData, setBacktestData] = useState(null);
   const [targetPct, setTargetPct] = useState(DEFAULT_TARGET_PCT);
   const [targetInput, setTargetInput] = useState(String(DEFAULT_TARGET_PCT));
+  const [rfPct, setRfPct] = useState(DEFAULT_RF_PCT);
+  const [rfInput, setRfInput] = useState(String(DEFAULT_RF_PCT));
+  const [neutralPrior, setNeutralPrior] = useState(false);
   const [loading, setLoading] = useState(false);
   const [btLoading, setBtLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const loadPortfolio = useCallback(async (pct) => {
+  const loadPortfolio = useCallback(async (pct, rf) => {
     setLoading(true);
     setError("");
     try {
       const [p, f] = await Promise.all([
-        getJSON(`/api/optimizer/portfolio?target_return=${pct / 100}`),
-        getJSON(`/api/optimizer/frontier?n_points=60`),
+        getJSON(`/api/optimizer/portfolio?target_return=${pct / 100}&rf_annual=${rf / 100}`),
+        getJSON(`/api/optimizer/frontier?n_points=60&rf_annual=${rf / 100}`),
       ]);
       setPortfolioData(p);
       setFrontierData(f);
@@ -42,14 +46,18 @@ export default function Optimizer() {
   }, []);
 
   useEffect(() => {
-    loadPortfolio(DEFAULT_TARGET_PCT);
+    loadPortfolio(DEFAULT_TARGET_PCT, DEFAULT_RF_PCT);
   }, [loadPortfolio]);
 
-  const runBacktest = useCallback(async (pct) => {
+  const runBacktest = useCallback(async (pct, rf, neutral) => {
     setBtLoading(true);
     setError("");
     try {
-      setBacktestData(await getJSON(`/api/optimizer/backtest?target_return=${pct / 100}`));
+      setBacktestData(
+        await getJSON(
+          `/api/optimizer/backtest?target_return=${pct / 100}&rf_annual=${rf / 100}&neutral_prior=${neutral}`,
+        ),
+      );
     } catch (e) {
       setError(e.message || "Backtest failed.");
     } finally {
@@ -57,15 +65,22 @@ export default function Optimizer() {
     }
   }, []);
 
-  const applyTarget = () => {
+  const applyControls = () => {
     const pct = parseFloat(targetInput);
-    if (isNaN(pct)) return;
+    const rf = parseFloat(rfInput);
+    if (isNaN(pct) || isNaN(rf)) return;
     setTargetPct(pct);
-    loadPortfolio(pct);
-    // Keep the backtest in sync with the target control, same as the
+    setRfPct(rf);
+    loadPortfolio(pct, rf);
+    // Keep the backtest in sync with these controls, same as the
     // portfolio/frontier above it — but only if it's already been run once;
     // it stays on-demand otherwise (it's the expensive call).
-    if (backtestData) runBacktest(pct);
+    if (backtestData) runBacktest(pct, rf, neutralPrior);
+  };
+
+  const toggleNeutralPrior = (checked) => {
+    setNeutralPrior(checked);
+    if (backtestData) runBacktest(targetPct, rfPct, checked);
   };
 
   const assetNames = portfolioData ? Object.keys(portfolioData.mu_weekly) : [];
@@ -82,18 +97,32 @@ export default function Optimizer() {
       <style>{css}</style>
       <div className="block-head">
         <h2><Compass size={16} /> Optimizer</h2>
-        <div className="target-ctrl">
-          <label htmlFor="target-return">Target return</label>
-          <input
-            id="target-return"
-            className="in sm"
-            inputMode="decimal"
-            value={targetInput}
-            onChange={(e) => setTargetInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && applyTarget()}
-          />
-          <span className="pct-sign">%</span>
-          <button className="add-btn" onClick={applyTarget} disabled={loading}>
+        <div className="controls-row">
+          <div className="ctrl-field">
+            <label htmlFor="target-return">Target return</label>
+            <input
+              id="target-return"
+              className="in sm"
+              inputMode="decimal"
+              value={targetInput}
+              onChange={(e) => setTargetInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && applyControls()}
+            />
+            <span className="pct-sign">%</span>
+          </div>
+          <div className="ctrl-field">
+            <label htmlFor="rf-rate">Risk-free rate</label>
+            <input
+              id="rf-rate"
+              className="in sm"
+              inputMode="decimal"
+              value={rfInput}
+              onChange={(e) => setRfInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && applyControls()}
+            />
+            <span className="pct-sign">%</span>
+          </div>
+          <button className="add-btn" onClick={applyControls} disabled={loading}>
             <RefreshCw size={13} className={loading ? "spin" : ""} />
             {loading ? "Solving…" : "Recalculate"}
           </button>
@@ -156,9 +185,23 @@ export default function Optimizer() {
           <div className="opt-backtest">
             <div className="opt-backtest-head">
               <h3>Walk-forward backtest</h3>
-              <button className="add-btn" onClick={() => runBacktest(targetPct)} disabled={btLoading}>
-                {btLoading ? "Running…" : "Run backtest"}
-              </button>
+              <div className="bt-controls">
+                <label className="bt-toggle">
+                  <input
+                    type="checkbox"
+                    checked={neutralPrior}
+                    onChange={(e) => toggleNeutralPrior(e.target.checked)}
+                  />
+                  Neutral prior (ignore my views)
+                </label>
+                <button
+                  className="add-btn"
+                  onClick={() => runBacktest(targetPct, rfPct, neutralPrior)}
+                  disabled={btLoading}
+                >
+                  {btLoading ? "Running…" : "Run backtest"}
+                </button>
+              </div>
             </div>
             {!backtestData && (
               <p className="empty">
@@ -169,6 +212,23 @@ export default function Optimizer() {
             )}
             {backtestData && (
               <>
+                <p className="bt-mode-note">
+                  {backtestData.neutral_prior ? (
+                    <>
+                      <strong>Neutral prior.</strong> Every rebalance re-estimated mu from an
+                      equal-weight prior with no views — this tests the shrinkage + optimisation
+                      machinery in isolation, uncontaminated by hindsight.
+                    </>
+                  ) : (
+                    <>
+                      <strong>Live prior.</strong> Every rebalance used your current
+                      STRATEGIC_WEIGHTS + VIEWS, even on historical windows — so Max Sharpe and
+                      Target here are partly a test of beliefs formed with full-sample hindsight,
+                      not just the machinery. GMV, 1/N and Strategic don't depend on mu, so they're
+                      identical either way — toggle "Neutral prior" to isolate the rest.
+                    </>
+                  )}
+                </p>
                 <EquityChart
                   series={backtestData.equity_curves}
                   colors={colorMap(Object.keys(backtestData.equity_curves))}
@@ -202,9 +262,10 @@ export default function Optimizer() {
 
 // ---------- styles (scoped by the viz-/opt- prefixes; shares tokens with App.css) ----------
 const css = `
-.target-ctrl{display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--muted);}
-.target-ctrl label{white-space:nowrap;}
-.target-ctrl .in.sm{flex:0 0 64px; min-width:0; padding:7px 8px;}
+.controls-row{display:flex; align-items:center; gap:16px; flex-wrap:wrap; font-size:12.5px; color:var(--muted);}
+.ctrl-field{display:flex; align-items:center; gap:8px;}
+.ctrl-field label{white-space:nowrap;}
+.ctrl-field .in.sm{flex:0 0 60px; min-width:0; padding:7px 8px;}
 .pct-sign{color:var(--muted);}
 
 code{font-family:'IBM Plex Mono',monospace; font-size:12px; background:var(--panel); padding:1px 5px; border-radius:2px;}
@@ -225,6 +286,12 @@ code{font-family:'IBM Plex Mono',monospace; font-size:12px; background:var(--pan
 .opt-frontier, .opt-backtest{margin-top:26px;}
 .opt-frontier h3, .opt-backtest-head h3{margin:0 0 10px; font-size:14.5px; font-weight:600; font-family:'Fraunces',serif;}
 .opt-backtest-head{display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;}
+.bt-controls{display:flex; align-items:center; gap:14px; flex-wrap:wrap;}
+.bt-toggle{display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer; white-space:nowrap;}
+.bt-toggle input{accent-color:var(--accent); cursor:pointer;}
+.bt-mode-note{font-size:12px; color:var(--muted); line-height:1.55; margin:0 0 12px; padding:9px 12px;
+  background:var(--panel); border-left:2px solid var(--accent); border-radius:0 2px 2px 0;}
+.bt-mode-note strong{color:var(--ink);}
 
 .viz-frontier, .viz-equity{background:var(--panel); border:1px solid var(--line); border-radius:3px; padding:14px; position:relative;}
 .viz-frontier svg, .viz-equity svg{width:100%; height:auto; display:block; overflow:visible;}
