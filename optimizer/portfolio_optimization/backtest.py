@@ -153,6 +153,7 @@ def estimate_window(
     rf_annual: float = RF_ANNUAL,
     neutral_prior: bool = NEUTRAL_PRIOR,
     strategic_weights: dict[str, float] | None = STRATEGIC_WEIGHTS,
+    views: list[tuple] = VIEWS,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Re-estimate (mu_weekly, cov_annual_np) on a trailing returns window.
 
@@ -166,22 +167,24 @@ def estimate_window(
         rf_annual: Annual risk-free rate for the excess/total conversion.
         neutral_prior: If True, use an equal-weight prior and no views — tests
             the shrinkage + optimisation machinery in isolation. If False
-            (default), uses `strategic_weights` + VIEWS, which is partly a
+            (default), uses `strategic_weights` + `views`, which is partly a
             test of hindsight beliefs (see module docstring).
         strategic_weights: Policy weights for the equilibrium prior. Ignored
             when `neutral_prior` is True.
+        views: Investor views (see expected_returns.VIEWS for the format).
+            Ignored when `neutral_prior` is True.
     """
     cov_df = compute_cov_preferred(window_returns)                  # Stage 3
 
     if neutral_prior:
-        sw, views = None, []                       # equal-weight prior, no views
+        sw, v = None, []                            # equal-weight prior, no views
     else:
-        sw, views = strategic_weights, VIEWS       # live policy prior + views
+        sw, v = strategic_weights, views            # live policy prior + views
 
     mu_weekly, _ = build_expected_returns(                          # Stage 4
         cov_df, ASSET_NAMES,
         strategic_weights=sw,
-        views=views,
+        views=v,
         rf_annual=rf_annual,
     )
     cov_np = np.asarray(cov_df.reindex(index=ASSET_NAMES, columns=ASSET_NAMES), float)
@@ -198,6 +201,7 @@ def run_backtest(
     rf_annual: float = RF_ANNUAL,
     neutral_prior: bool = NEUTRAL_PRIOR,
     strategic_weights: dict[str, float] | None = STRATEGIC_WEIGHTS,
+    views: list[tuple] = VIEWS,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     """Run the walk-forward backtest.
 
@@ -217,11 +221,13 @@ def run_backtest(
         neutral_prior: If True, each window's mu is estimated with an
             equal-weight prior and no views — tests the optimisation
             machinery in isolation, uncontaminated by hindsight. If False
-            (default), uses `strategic_weights` + VIEWS at every historical
+            (default), uses `strategic_weights` + `views` at every historical
             rebalance, which is partly a backtest of beliefs formed with
             full-sample hindsight — see module docstring.
         strategic_weights: Policy weights for the equilibrium prior at each
             rebalance. Ignored when `neutral_prior` is True.
+        views: Investor views applied at each rebalance. Ignored when
+            `neutral_prior` is True.
 
     Returns:
         weekly_returns: realised weekly SIMPLE returns per strategy (OOS only).
@@ -255,7 +261,8 @@ def run_backtest(
         lo = 0 if WINDOW_MODE == "expanding" else t - WINDOW_WEEKS
         window = returns_df.iloc[lo:t]                # strictly before t
         mu_weekly, cov_np = estimate_window(
-            window, rf_annual=rf_annual, neutral_prior=neutral_prior, strategic_weights=strategic_weights,
+            window, rf_annual=rf_annual, neutral_prior=neutral_prior,
+            strategic_weights=strategic_weights, views=views,
         )
 
         # Build target weights for each strategy at this rebalance.
