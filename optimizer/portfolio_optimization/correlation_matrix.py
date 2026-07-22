@@ -40,12 +40,13 @@ from codelib.statistics.moments import cov_to_corr_matrix
 
 # ============================================================
 # INVESTABLE UNIVERSE
-# The assets we actually hold and optimise over. Comment any of
-# them out freely — including the global fund — without breaking
-# the market-proxy logic below.
+# The full set of assets you can choose to hold and optimise over. `tickers`
+# below picks the currently ACTIVE subset — comment/uncomment freely there,
+# or (since the API/dashboard added a universe selector) pick a different
+# subset per-request instead of editing this file at all.
 # ============================================================
 
-tickers = {
+CANDIDATE_TICKERS = {
     "Global": "IWDA.AS",
     "Asia": "AAXJ",
     "Europe": "IMAE.AS",
@@ -53,14 +54,34 @@ tickers = {
     "Technology": "XDWT.DE",
     "HBONDS": "0P0001ILS7.IR",
     "GRID": "GRID.DE",
- #   "Industrials": "ESIN.DE",
- #   "Atea": "ATEA.OL",
- #   "Austevoll": "AUSS.OL",
- #   "DNB": "DNB.OL",
- #   "Equinor": "EQNR.OL",
- #   "SalMar": "SALM.OL",
- #   "Veidekke": "VEI.OL",
+    "Industrials": "ESIN.DE",
+    "Atea": "ATEA.OL",
+    "Austevoll": "AUSS.OL",
+    "DNB": "DNB.OL",
+    "Equinor": "EQNR.OL",
+    "SalMar": "SALM.OL",
+    "Veidekke": "VEI.OL",
 }
+
+# Currently active subset. Comment/uncomment names here to change the default
+# CLI/import-time universe; extra names in CANDIDATE_TICKERS above are simply
+# unused until picked, either here or via a request's `assets` list.
+tickers = {name: CANDIDATE_TICKERS[name] for name in [
+    "Global",
+    "Asia",
+    "Europe",
+    "Norway",
+    "Technology",
+    "HBONDS",
+    "GRID",
+ #   "Industrials",
+ #   "Atea",
+ #   "Austevoll",
+ #   "DNB",
+ #   "Equinor",
+ #   "SalMar",
+ #   "Veidekke",
+]}
 
 # Asset order for every downstream stage. Derived from `tickers` directly (not
 # from a downloaded frame's columns), so it is known without hitting the

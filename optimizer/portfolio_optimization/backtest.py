@@ -100,11 +100,6 @@ NEUTRAL_PRIOR = False
 # The target-return builder can raise ValueError when the fixed target is
 # unattainable for a given window; the walk-forward loop handles that.
 # ---------------------------------------------------------------------------
-def _w_equal(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
-    n = len(ASSET_NAMES)
-    return np.full(n, 1.0 / n)
-
-
 def _w_gmv(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
     return constrained_gmv(mu_weekly, cov_np)
 
@@ -113,14 +108,20 @@ def build_strategies(
     target_return_annual: float = TARGET_RETURN_ANNUAL,
     rf_annual: float = RF_ANNUAL,
     strategic_weights: dict[str, float] | None = STRATEGIC_WEIGHTS,
+    asset_names: list[str] = ASSET_NAMES,
 ) -> dict[str, callable]:
-    """Build the strategy dict for a given target return, rf, and policy weights.
+    """Build the strategy dict for a given target return, rf, policy weights,
+    and asset universe.
 
     A function rather than a module-level constant so callers (the API layer
     included) can backtest different assumptions without touching the
     pipeline's own defaults — labels are derived from whatever is actually
     passed in, so they never drift out of sync with the numbers used.
     """
+    def _w_equal(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
+        n = len(asset_names)
+        return np.full(n, 1.0 / n)
+
     def _w_target(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
         return optimal_portfolio(mu_weekly, cov_np, target_return_annual)
 
@@ -129,7 +130,7 @@ def build_strategies(
 
     def _w_strategic(mu_weekly: np.ndarray, cov_np: np.ndarray) -> np.ndarray:
         # The BL prior itself, held as a static policy allocation.
-        return build_reference_weights(ASSET_NAMES, strategic_weights)
+        return build_reference_weights(asset_names, strategic_weights)
 
     return {
         "1/N (equal)": _w_equal,
@@ -154,6 +155,7 @@ def estimate_window(
     neutral_prior: bool = NEUTRAL_PRIOR,
     strategic_weights: dict[str, float] | None = STRATEGIC_WEIGHTS,
     views: list[tuple] = VIEWS,
+    asset_names: list[str] = ASSET_NAMES,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Re-estimate (mu_weekly, cov_annual_np) on a trailing returns window.
 
@@ -163,7 +165,7 @@ def estimate_window(
 
     Args:
         window_returns: Trailing weekly log-return slice, strictly before the
-            rebalance date (no look-ahead).
+            rebalance date (no look-ahead). Columns must match `asset_names`.
         rf_annual: Annual risk-free rate for the excess/total conversion.
         neutral_prior: If True, use an equal-weight prior and no views — tests
             the shrinkage + optimisation machinery in isolation. If False
@@ -173,6 +175,8 @@ def estimate_window(
             when `neutral_prior` is True.
         views: Investor views (see expected_returns.VIEWS for the format).
             Ignored when `neutral_prior` is True.
+        asset_names: Asset order to align to — must match `window_returns`'s
+            columns (as a set; reindexed here for the covariance matrix).
     """
     cov_df = compute_cov_preferred(window_returns)                  # Stage 3
 
@@ -182,12 +186,12 @@ def estimate_window(
         sw, v = strategic_weights, views            # live policy prior + views
 
     mu_weekly, _ = build_expected_returns(                          # Stage 4
-        cov_df, ASSET_NAMES,
+        cov_df, asset_names,
         strategic_weights=sw,
         views=v,
         rf_annual=rf_annual,
     )
-    cov_np = np.asarray(cov_df.reindex(index=ASSET_NAMES, columns=ASSET_NAMES), float)
+    cov_np = np.asarray(cov_df.reindex(index=asset_names, columns=asset_names), float)
     cov_np = (cov_np + cov_np.T) / 2.0
     return np.asarray(mu_weekly, dtype=float), cov_np
 
@@ -202,20 +206,23 @@ def run_backtest(
     neutral_prior: bool = NEUTRAL_PRIOR,
     strategic_weights: dict[str, float] | None = STRATEGIC_WEIGHTS,
     views: list[tuple] = VIEWS,
+    asset_names: list[str] = ASSET_NAMES,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     """Run the walk-forward backtest.
 
     Args:
         returns_df: Weekly log-return DataFrame to backtest over. Defaults to
             `get_default_universe().returns` (the live universe) when omitted.
+            Columns must match `asset_names`.
         strategies: Strategy dict to test, as built by `build_strategies()`.
-            Defaults to the module-level `STRATEGIES` (target/rf/weights = the
-            pipeline's own defaults) when omitted — pass
+            Defaults to the module-level `STRATEGIES` (target/rf/weights/
+            universe = the pipeline's own defaults) when omitted — pass
             `build_strategies(target_return_annual=..., rf_annual=...,
-            strategic_weights=...)` to backtest different assumptions.
-            NOTE: if you pass custom `rf_annual`/`strategic_weights` here,
-            pass the SAME values to `build_strategies()` — they aren't linked
-            automatically, since a strategy dict can be reused across calls.
+            strategic_weights=..., asset_names=...)` to backtest different
+            assumptions. NOTE: if you pass custom `rf_annual`/
+            `strategic_weights`/`asset_names` here, pass the SAME values to
+            `build_strategies()` — they aren't linked automatically, since a
+            strategy dict can be reused across calls.
         rf_annual: Annual risk-free rate used to re-estimate mu at each
             rebalance (see `estimate_window`).
         neutral_prior: If True, each window's mu is estimated with an
@@ -228,6 +235,9 @@ def run_backtest(
             rebalance. Ignored when `neutral_prior` is True.
         views: Investor views applied at each rebalance. Ignored when
             `neutral_prior` is True.
+        asset_names: Asset universe to backtest over. Must match
+            `returns_df`'s columns (as a set) and whatever `strategies` was
+            built with.
 
     Returns:
         weekly_returns: realised weekly SIMPLE returns per strategy (OOS only).
@@ -255,14 +265,14 @@ def run_backtest(
     weekly_rows: dict[str, list[float]] = {nm: [] for nm in names}
     oos_dates: list[pd.Timestamp] = []
     infeasible: dict[str, int] = {nm: 0 for nm in names}
-    last_w: dict[str, np.ndarray] = {nm: np.full(len(ASSET_NAMES), 1.0 / len(ASSET_NAMES)) for nm in names}
+    last_w: dict[str, np.ndarray] = {nm: np.full(len(asset_names), 1.0 / len(asset_names)) for nm in names}
 
     for k, t in enumerate(rebal_idx):
         lo = 0 if WINDOW_MODE == "expanding" else t - WINDOW_WEEKS
         window = returns_df.iloc[lo:t]                # strictly before t
         mu_weekly, cov_np = estimate_window(
             window, rf_annual=rf_annual, neutral_prior=neutral_prior,
-            strategic_weights=strategic_weights, views=views,
+            strategic_weights=strategic_weights, views=views, asset_names=asset_names,
         )
 
         # Build target weights for each strategy at this rebalance.

@@ -9,8 +9,9 @@ backtest.py) — no logic is duplicated here, this file only shapes their
 outputs into JSON.
 
 /portfolio, /frontier, /backtest take a JSON body (not query params) because
-they accept strategic_weights (a per-asset dict) and views (a list of typed
-view objects) — neither fits cleanly in a query string.
+they accept strategic_weights (a per-asset dict), views (a list of typed view
+objects), and assets (a list of asset names) — none of which fit cleanly in a
+query string.
 
 No auth, no database, no rate limiting: this mirrors the pipeline's current
 single-user, personal-tool scope. Add auth before exposing this beyond
@@ -34,12 +35,16 @@ from codelib.statistics.moments import cov_to_corr_matrix
 import portfolio_optimization.correlation_matrix as correlation_matrix
 from portfolio_optimization.correlation_matrix import (
     ASSET_NAMES,
+    CANDIDATE_TICKERS,
     COV_METHOD,
+    UniverseData,
     compute_cov_preferred,
     get_default_universe,
+    load_universe,
     tickers,
 )
 from portfolio_optimization.expected_returns import (
+    CANDIDATE_STRATEGIC_WEIGHTS,
     RF_ANNUAL,
     STRATEGIC_WEIGHTS,
     VIEW_CONFIDENCE,
@@ -90,6 +95,7 @@ class PortfolioRequest(BaseModel):
     rf_annual: float = RF_ANNUAL
     strategic_weights: dict[str, float] | None = None  # None = pipeline default
     views: list[ViewRequest] | None = None              # None = pipeline default
+    assets: list[str] | None = None                     # None = pipeline default universe
 
 
 class FrontierRequest(BaseModel):
@@ -97,6 +103,7 @@ class FrontierRequest(BaseModel):
     rf_annual: float = RF_ANNUAL
     strategic_weights: dict[str, float] | None = None
     views: list[ViewRequest] | None = None
+    assets: list[str] | None = None
 
 
 class BacktestRequest(BaseModel):
@@ -105,14 +112,61 @@ class BacktestRequest(BaseModel):
     neutral_prior: bool = False
     strategic_weights: dict[str, float] | None = None
     views: list[ViewRequest] | None = None
+    assets: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_strategic_weights(sw: dict[str, float] | None) -> dict[str, float]:
-    """Fall back to the pipeline default, and validate against ASSET_NAMES.
+def _resolve_universe(assets: list[str] | None) -> tuple[list[str], UniverseData]:
+    """Fall back to the pipeline default universe, or validate + load a
+    custom asset subset from CANDIDATE_TICKERS.
+
+    A custom subset always downloads fresh (not memoised like the default) —
+    this is a deliberate, on-demand action from the universe editor, not
+    something hit on every request.
+
+    Raises:
+        HTTPException: 400, on an unknown asset name or fewer than 2 assets.
+        HTTPException: 502, if the price download fails.
+    """
+    if assets is None:
+        try:
+            return ASSET_NAMES, get_default_universe()
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    unknown = [a for a in assets if a not in CANDIDATE_TICKERS]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown asset(s) {unknown}. Known: {list(CANDIDATE_TICKERS)}.",
+        )
+    # Dedupe, preserving order.
+    names = list(dict.fromkeys(assets))
+    if len(names) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Need at least 2 assets to optimise over; got {names}.",
+        )
+
+    subset = {name: CANDIDATE_TICKERS[name] for name in names}
+    try:
+        return names, load_universe(tickers=subset)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _resolve_strategic_weights(sw: dict[str, float] | None, asset_names: list[str]) -> dict[str, float]:
+    """Fall back to the full candidate policy weights, and validate against
+    `asset_names`.
+
+    The fallback is CANDIDATE_STRATEGIC_WEIGHTS (the full 14-asset superset),
+    not the active-universe-only STRATEGIC_WEIGHTS — build_reference_weights
+    ignores extra keys, so this is behaviourally identical for the default
+    universe while also giving any newly-selected asset a sensible starting
+    weight automatically, with no frontend guessing required.
 
     Centralised here so every route validates the same way, once, up front —
     letting an invalid dict reach `run_backtest()` would otherwise fail
@@ -122,32 +176,50 @@ def _resolve_strategic_weights(sw: dict[str, float] | None) -> dict[str, float]:
     Raises:
         HTTPException: 400, if weights are missing an asset or non-positive.
     """
-    resolved = STRATEGIC_WEIGHTS if sw is None else sw
+    resolved = CANDIDATE_STRATEGIC_WEIGHTS if sw is None else sw
     try:
-        build_reference_weights(ASSET_NAMES, resolved)
+        build_reference_weights(asset_names, resolved)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return resolved
 
 
-def _resolve_views(views: list[ViewRequest] | None) -> list[tuple]:
+def _resolve_views(views: list[ViewRequest] | None, asset_names: list[str]) -> list[tuple]:
     """Fall back to the pipeline default (VIEWS), or convert + validate a
-    custom list against ASSET_NAMES.
+    custom list against `asset_names`.
 
     Validated here rather than inside apply_views() (which needs a live
     BlackLitterman instance to mutate, so it can't be called standalone) —
     same reasoning as `_resolve_strategic_weights`: fail with a clean 400 now
     rather than an uncaught exception mid-backtest.
 
+    NOTE: the pipeline default VIEWS references assets from the default
+    7-asset universe (HBONDS, Technology, Global, GRID). If a custom `assets`
+    list drops one of those, pass `views=[]` explicitly (not None) — leaving
+    it None here would otherwise try to validate the default VIEWS against
+    the smaller universe and 400.
+
     Raises:
         HTTPException: 400, on an unknown asset, a missing required field, or
             a non-positive confidence.
     """
     if views is None:
-        return VIEWS
+        views = VIEWS
+        # Silently drop default views that don't apply to a custom universe —
+        # this only fires for the *pipeline* default views against a custom
+        # asset list, not for anything the user explicitly typed in.
+        views = [
+            spec for spec in views
+            if all(name in asset_names for name in _view_asset_names(spec))
+        ]
 
     tuples: list[tuple] = []
     for i, v in enumerate(views, start=1):
+        # v may already be a raw tuple (from the VIEWS fallback above) or a
+        # ViewRequest (from the request body) — normalise to one shape.
+        if isinstance(v, tuple):
+            v = _tuple_to_view_request(v)
+
         conf = VIEW_CONFIDENCE if v.confidence is None else v.confidence
         if conf <= 0:
             raise HTTPException(status_code=400, detail=f"View {i}: confidence must be positive; got {conf}.")
@@ -155,10 +227,10 @@ def _resolve_views(views: list[ViewRequest] | None) -> list[tuple]:
         if v.type == "absolute":
             if not v.asset:
                 raise HTTPException(status_code=400, detail=f"View {i}: absolute view requires 'asset'.")
-            if v.asset not in ASSET_NAMES:
+            if v.asset not in asset_names:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"View {i}: unknown asset '{v.asset}'. Known: {ASSET_NAMES}.",
+                    detail=f"View {i}: unknown asset '{v.asset}'. Known: {asset_names}.",
                 )
             tuples.append(("absolute", v.asset, v.target, conf))
         else:  # "relative"
@@ -171,13 +243,27 @@ def _resolve_views(views: list[ViewRequest] | None) -> list[tuple]:
                     status_code=400, detail=f"View {i}: 'long_asset' and 'short_asset' must differ.",
                 )
             for name in (v.long_asset, v.short_asset):
-                if name not in ASSET_NAMES:
+                if name not in asset_names:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"View {i}: unknown asset '{name}'. Known: {ASSET_NAMES}.",
+                        detail=f"View {i}: unknown asset '{name}'. Known: {asset_names}.",
                     )
             tuples.append(("relative", v.long_asset, v.short_asset, v.target, conf))
     return tuples
+
+
+def _view_asset_names(spec: tuple) -> list[str]:
+    """Asset name(s) a raw VIEWS tuple references, for the default-universe filter above."""
+    return [spec[1]] if spec[0] == "absolute" else [spec[1], spec[2]]
+
+
+def _tuple_to_view_request(spec: tuple) -> ViewRequest:
+    kind = spec[0]
+    if kind == "absolute":
+        conf = spec[3] if len(spec) >= 4 else None
+        return ViewRequest(type="absolute", asset=spec[1], target=spec[2], confidence=conf)
+    conf = spec[4] if len(spec) >= 5 else None
+    return ViewRequest(type="relative", long_asset=spec[1], short_asset=spec[2], target=spec[3], confidence=conf)
 
 
 def _views_to_dicts(views_tuples: list[tuple]) -> list[dict]:
@@ -201,26 +287,18 @@ def _views_to_dicts(views_tuples: list[tuple]) -> list[dict]:
 
 
 def _cov_and_mu(
+    universe: UniverseData, asset_names: list[str],
     rf_annual: float, strategic_weights: dict[str, float], views: list[tuple],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fresh (cov_annual, mu_weekly) off the current default universe.
+    """(cov_annual, mu_weekly) for the given universe/assumptions.
 
     Callers must resolve/validate `strategic_weights`/`views` first (see
     `_resolve_strategic_weights`/`_resolve_views`) — this function assumes
     they're already valid.
-
-    Raises:
-        HTTPException: 502, if the universe can't be loaded (e.g. the price
-            download failed).
     """
-    try:
-        universe = get_default_universe()
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
     cov_df = compute_cov_preferred(universe.returns, universe.market_returns, method=COV_METHOD)
     mu_weekly, _bl = build_expected_returns(
-        cov_df, ASSET_NAMES, views=views, rf_annual=rf_annual, strategic_weights=strategic_weights,
+        cov_df, asset_names, views=views, rf_annual=rf_annual, strategic_weights=strategic_weights,
     )
 
     cov = np.asarray(cov_df, dtype=float)
@@ -228,19 +306,20 @@ def _cov_and_mu(
     return cov, np.asarray(mu_weekly, dtype=float)
 
 
-def _weight_dict(weights: np.ndarray) -> dict[str, float]:
-    return {name: float(w) for name, w in zip(ASSET_NAMES, weights)}
+def _weight_dict(weights: np.ndarray, asset_names: list[str]) -> dict[str, float]:
+    return {name: float(w) for name, w in zip(asset_names, weights)}
 
 
 def _portfolio_summary(
-    weights: np.ndarray, mu_weekly: np.ndarray, cov: np.ndarray, rf_annual: float = RF_ANNUAL,
+    weights: np.ndarray, mu_weekly: np.ndarray, cov: np.ndarray, asset_names: list[str],
+    rf_annual: float = RF_ANNUAL,
 ) -> dict:
     mu_annual = mu_weekly * WEEKS_PER_YEAR
     ret = float(portfolio_mean(weights, mu_annual))
     vol = float(portfolio_std(weights, cov))
     sharpe = (ret - rf_annual) / vol if vol > 1e-10 else None
     return {
-        "weights": _weight_dict(weights),
+        "weights": _weight_dict(weights, asset_names),
         "return_annual": ret,
         "vol_annual": vol,
         "sharpe": sharpe,
@@ -260,13 +339,17 @@ def health():
 def universe():
     """Static universe config — no network call, safe to poll freely.
 
-    strategic_weights/views here are the pipeline's DEFAULTS — the values to
-    pre-populate the editors with, not necessarily what the last /portfolio
-    call used (that's echoed back on each response instead).
+    asset_names/tickers/strategic_weights/views are the pipeline's DEFAULTS —
+    the values to pre-populate the editors with, not necessarily what the
+    last /portfolio call used (that's echoed back on each response instead).
+    candidate_tickers/candidate_strategic_weights are the FULL selectable
+    universe, for the asset picker.
     """
     return {
         "asset_names": ASSET_NAMES,
         "tickers": tickers,
+        "candidate_tickers": CANDIDATE_TICKERS,
+        "candidate_strategic_weights": CANDIDATE_STRATEGIC_WEIGHTS,
         "max_weight": MAX_WEIGHT,
         "strategic_weights": STRATEGIC_WEIGHTS,
         "views": _views_to_dicts(VIEWS),
@@ -292,9 +375,10 @@ def refresh():
 
 @app.post("/portfolio")
 def portfolio(req: PortfolioRequest):
-    sw = _resolve_strategic_weights(req.strategic_weights)
-    v = _resolve_views(req.views)
-    cov, mu_weekly = _cov_and_mu(req.rf_annual, sw, v)
+    asset_names, univ = _resolve_universe(req.assets)
+    sw = _resolve_strategic_weights(req.strategic_weights, asset_names)
+    v = _resolve_views(req.views, asset_names)
+    cov, mu_weekly = _cov_and_mu(univ, asset_names, req.rf_annual, sw, v)
 
     w_gmv = constrained_gmv(mu_weekly, cov)
     w_ms = constrained_max_sharpe(mu_weekly, cov, req.rf_annual)
@@ -302,21 +386,22 @@ def portfolio(req: PortfolioRequest):
     target_summary, target_error = None, None
     try:
         w_target = optimal_portfolio(mu_weekly, cov, req.target_return)
-        target_summary = _portfolio_summary(w_target, mu_weekly, cov, req.rf_annual)
+        target_summary = _portfolio_summary(w_target, mu_weekly, cov, asset_names, req.rf_annual)
     except (ValueError, RuntimeError) as exc:
         target_error = str(exc)
 
     return {
+        "asset_names": asset_names,
         "rf_annual": req.rf_annual,
         "target_return_annual": req.target_return,
         "strategic_weights": sw,
         "views": _views_to_dicts(v),
-        "mu_weekly": _weight_dict(mu_weekly),
-        "mu_annual": _weight_dict(mu_weekly * WEEKS_PER_YEAR),
+        "mu_weekly": _weight_dict(mu_weekly, asset_names),
+        "mu_annual": _weight_dict(mu_weekly * WEEKS_PER_YEAR, asset_names),
         "covariance_condition_number": float(np.linalg.cond(cov)),
         "portfolios": {
-            "gmv": _portfolio_summary(w_gmv, mu_weekly, cov, req.rf_annual),
-            "max_sharpe": _portfolio_summary(w_ms, mu_weekly, cov, req.rf_annual),
+            "gmv": _portfolio_summary(w_gmv, mu_weekly, cov, asset_names, req.rf_annual),
+            "max_sharpe": _portfolio_summary(w_ms, mu_weekly, cov, asset_names, req.rf_annual),
             "target": target_summary,
         },
         "target_error": target_error,
@@ -325,12 +410,13 @@ def portfolio(req: PortfolioRequest):
 
 @app.post("/frontier")
 def frontier(req: FrontierRequest):
-    sw = _resolve_strategic_weights(req.strategic_weights)
-    v = _resolve_views(req.views)
-    cov, mu_weekly = _cov_and_mu(req.rf_annual, sw, v)
+    asset_names, univ = _resolve_universe(req.assets)
+    sw = _resolve_strategic_weights(req.strategic_weights, asset_names)
+    v = _resolve_views(req.views, asset_names)
+    cov, mu_weekly = _cov_and_mu(univ, asset_names, req.rf_annual, sw, v)
     mu_f, std_f, w_f = compute_constrained_frontier(mu_weekly, cov, n_points=req.n_points)
     points = [
-        {"return_annual": float(r), "vol_annual": float(s), "weights": _weight_dict(w)}
+        {"return_annual": float(r), "vol_annual": float(s), "weights": _weight_dict(w, asset_names)}
         for r, s, w in zip(mu_f, std_f, w_f)
     ]
     return {"points": points}
@@ -354,17 +440,21 @@ def correlation():
 
 @app.post("/backtest")
 def backtest(req: BacktestRequest):
-    sw = _resolve_strategic_weights(req.strategic_weights)
-    v = _resolve_views(req.views)
+    asset_names, univ = _resolve_universe(req.assets)
+    sw = _resolve_strategic_weights(req.strategic_weights, asset_names)
+    v = _resolve_views(req.views, asset_names)
     try:
         weekly_returns, equity, infeasible = run_backtest(
+            returns_df=univ.returns,
             strategies=build_strategies(
-                target_return_annual=req.target_return, rf_annual=req.rf_annual, strategic_weights=sw,
+                target_return_annual=req.target_return, rf_annual=req.rf_annual,
+                strategic_weights=sw, asset_names=asset_names,
             ),
             rf_annual=req.rf_annual,
             neutral_prior=req.neutral_prior,
             strategic_weights=sw,
             views=v,
+            asset_names=asset_names,
         )
     except SystemExit as exc:
         # run_backtest() raises SystemExit when there isn't enough history for
@@ -373,6 +463,7 @@ def backtest(req: BacktestRequest):
 
     table = performance_table(weekly_returns, rf_annual=req.rf_annual)
     return {
+        "asset_names": asset_names,
         "performance": table.to_dict(orient="index"),
         "equity_curves": {
             col: {str(idx.date()): float(v) for idx, v in equity[col].items()}

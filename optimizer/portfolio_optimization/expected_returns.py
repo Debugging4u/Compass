@@ -126,21 +126,32 @@ VIEW_CONFIDENCE = 1.0
 #     work.
 #   * Keys must cover every asset in ``returns.columns``. Extra keys not present
 #     in the universe are simply ignored.
-STRATEGIC_WEIGHTS: dict[str, float] = {
+# Full candidate set, including assets not currently active in
+# correlation_matrix.tickers — so re-activating one via the API's universe
+# selector has a sensible starting weight instead of an arbitrary placeholder.
+# build_reference_weights() ignores keys not in asset_names, so this superset
+# is safe to hand it directly regardless of which subset is actually active.
+CANDIDATE_STRATEGIC_WEIGHTS: dict[str, float] = {
     "Global": 77.0,
     "Asia": 5.0,
     "Europe": 5.0,
     "Norway": 1.0,
     "Technology": 2.0,
     "HBONDS": 30.0,
-   # "Industrials": 2.0,
     "GRID": 1.0,
-    #"Atea": 11.0,
-    #"Austevoll": 11.0,
-    #"DNB": 11.0,
-    #"Equinor": 11.0,
-    #"SalMar": 11.0,
-    #"Veidekke": 11.0,
+    "Industrials": 2.0,
+    "Atea": 11.0,
+    "Austevoll": 11.0,
+    "DNB": 11.0,
+    "Equinor": 11.0,
+    "SalMar": 11.0,
+    "Veidekke": 11.0,
+}
+
+STRATEGIC_WEIGHTS: dict[str, float] = {
+    name: CANDIDATE_STRATEGIC_WEIGHTS[name] for name in [
+        "Global", "Asia", "Europe", "Norway", "Technology", "HBONDS", "GRID",
+    ]
 }
 
 # Investor views. Empty list => pure equilibrium returns. All targets are in ANNUAL TOTAL-return units. Each

@@ -84,6 +84,11 @@ function parseViews(viewsInput) {
 
 export default function Optimizer() {
   const [assetNames, setAssetNames] = useState([]);
+  const [defaultAssetNames, setDefaultAssetNames] = useState(null);
+  const [candidateTickers, setCandidateTickers] = useState({});
+  const [candidateWeights, setCandidateWeights] = useState({});
+  const [showUniverse, setShowUniverse] = useState(false);
+
   const [defaultWeights, setDefaultWeights] = useState(null);
   const [weightsInput, setWeightsInput] = useState({});
   const [showWeights, setShowWeights] = useState(false);
@@ -105,16 +110,16 @@ export default function Optimizer() {
   const [btLoading, setBtLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const loadPortfolio = useCallback(async (pct, rf, weights, views) => {
+  const loadPortfolio = useCallback(async (pct, rf, weights, views, assets) => {
     setLoading(true);
     setError("");
     try {
       const [p, f] = await Promise.all([
         postJSON("/api/optimizer/portfolio", {
-          target_return: pct / 100, rf_annual: rf / 100, strategic_weights: weights, views,
+          target_return: pct / 100, rf_annual: rf / 100, strategic_weights: weights, views, assets,
         }),
         postJSON("/api/optimizer/frontier", {
-          n_points: 60, rf_annual: rf / 100, strategic_weights: weights, views,
+          n_points: 60, rf_annual: rf / 100, strategic_weights: weights, views, assets,
         }),
       ]);
       setPortfolioData(p);
@@ -126,13 +131,17 @@ export default function Optimizer() {
     }
   }, []);
 
-  // On mount: fetch the universe (asset order + the pipeline's default policy
-  // weights/views, to pre-populate the editors), then load portfolio/frontier.
+  // On mount: fetch the universe (candidate assets + the pipeline's default
+  // active subset/policy weights/views, to pre-populate the editors), then
+  // load portfolio/frontier.
   useEffect(() => {
     (async () => {
       try {
         const u = await getJSON("/api/optimizer/universe");
         setAssetNames(u.asset_names);
+        setDefaultAssetNames(u.asset_names);
+        setCandidateTickers(u.candidate_tickers);
+        setCandidateWeights(u.candidate_strategic_weights);
         setDefaultWeights(u.strategic_weights);
         setDefaultViews(u.views);
         setDefaultConfidence(u.default_confidence);
@@ -144,21 +153,21 @@ export default function Optimizer() {
 
         // u.views is already ViewRequest-shaped (that's what _views_to_dicts
         // produces server-side), so it can go straight back into the request body.
-        await loadPortfolio(DEFAULT_TARGET_PCT, DEFAULT_RF_PCT, u.strategic_weights, u.views);
+        await loadPortfolio(DEFAULT_TARGET_PCT, DEFAULT_RF_PCT, u.strategic_weights, u.views, u.asset_names);
       } catch (e) {
         setError(e.message || "Couldn't reach the optimizer service.");
       }
     })();
   }, [loadPortfolio]);
 
-  const runBacktest = useCallback(async (pct, rf, neutral, weights, views) => {
+  const runBacktest = useCallback(async (pct, rf, neutral, weights, views, assets) => {
     setBtLoading(true);
     setError("");
     try {
       setBacktestData(
         await postJSON("/api/optimizer/backtest", {
           target_return: pct / 100, rf_annual: rf / 100, neutral_prior: neutral,
-          strategic_weights: weights, views,
+          strategic_weights: weights, views, assets,
         }),
       );
     } catch (e) {
@@ -174,6 +183,10 @@ export default function Optimizer() {
     const weights = parseWeights(weightsInput);
     const views = parseViews(viewsInput);
     if (isNaN(pct) || isNaN(rf)) return;
+    if (assetNames.length < 2) {
+      setError("Pick at least 2 assets in the universe editor.");
+      return;
+    }
     if (!weights) {
       setError("Strategic weights must all be numbers.");
       return;
@@ -184,11 +197,11 @@ export default function Optimizer() {
     }
     setTargetPct(pct);
     setRfPct(rf);
-    loadPortfolio(pct, rf, weights, views);
+    loadPortfolio(pct, rf, weights, views, assetNames);
     // Keep the backtest in sync with these controls, same as the
     // portfolio/frontier above it — but only if it's already been run once;
     // it stays on-demand otherwise (it's the expensive call).
-    if (backtestData) runBacktest(pct, rf, neutralPrior, weights, views);
+    if (backtestData) runBacktest(pct, rf, neutralPrior, weights, views, assetNames);
   };
 
   const toggleNeutralPrior = (checked) => {
@@ -196,19 +209,68 @@ export default function Optimizer() {
     if (backtestData) {
       const weights = parseWeights(weightsInput);
       const views = parseViews(viewsInput);
-      if (weights && views) runBacktest(targetPct, rfPct, checked, weights, views);
+      if (weights && views) runBacktest(targetPct, rfPct, checked, weights, views, assetNames);
+    }
+  };
+
+  // Adding/removing an asset only updates local editor state (cheap); it
+  // takes a Recalculate click to actually re-fetch, same as target/rf typing.
+  const toggleAsset = (name, checked) => {
+    const order = Object.keys(candidateTickers);
+    setAssetNames((prev) => {
+      const set = new Set(prev);
+      if (checked) set.add(name); else set.delete(name);
+      return order.filter((n) => set.has(n));
+    });
+    if (checked) {
+      setWeightsInput((w) => (name in w ? w : { ...w, [name]: String(candidateWeights[name] ?? 1) }));
+    } else {
+      setWeightsInput((w) => {
+        const { [name]: _dropped, ...rest } = w;
+        return rest;
+      });
+      setViewsInput((vs) => vs.filter((v) =>
+        v.type === "absolute" ? v.asset !== name : v.longAsset !== name && v.shortAsset !== name,
+      ));
+    }
+  };
+
+  const resetUniverse = () => {
+    if (!defaultAssetNames) return;
+    const dropped = new Set(assetNames.filter((n) => !defaultAssetNames.includes(n)));
+
+    // Backfill weights for any default asset previously toggled off (its
+    // weightsInput entry would have been removed then), and drop entries for
+    // whatever this reset is now excluding.
+    const nextWeights = Object.fromEntries(Object.entries(weightsInput).filter(([n]) => !dropped.has(n)));
+    for (const name of defaultAssetNames) {
+      if (!(name in nextWeights)) nextWeights[name] = String(candidateWeights[name] ?? 1);
+    }
+    const nextViews = viewsInput.filter((v) =>
+      v.type === "absolute" ? !dropped.has(v.asset) : !dropped.has(v.longAsset) && !dropped.has(v.shortAsset),
+    );
+
+    setAssetNames(defaultAssetNames);
+    setWeightsInput(nextWeights);
+    setViewsInput(nextViews);
+
+    const weights = parseWeights(nextWeights);
+    const views = parseViews(nextViews);
+    if (weights && views) {
+      loadPortfolio(targetPct, rfPct, weights, views, defaultAssetNames);
+      if (backtestData) runBacktest(targetPct, rfPct, neutralPrior, weights, views, defaultAssetNames);
     }
   };
 
   const resetWeights = () => {
     if (!defaultWeights) return;
     const inputs = {};
-    for (const name of assetNames) inputs[name] = String(defaultWeights[name]);
+    for (const name of assetNames) inputs[name] = String(defaultWeights[name] ?? candidateWeights[name] ?? 1);
     setWeightsInput(inputs);
     const views = parseViews(viewsInput);
     if (views) {
-      loadPortfolio(targetPct, rfPct, defaultWeights, views);
-      if (backtestData) runBacktest(targetPct, rfPct, neutralPrior, defaultWeights, views);
+      loadPortfolio(targetPct, rfPct, defaultWeights, views, assetNames);
+      if (backtestData) runBacktest(targetPct, rfPct, neutralPrior, defaultWeights, views, assetNames);
     }
   };
 
@@ -217,8 +279,8 @@ export default function Optimizer() {
     setViewsInput(defaultViews.map(viewFromApi));
     const weights = parseWeights(weightsInput);
     if (weights) {
-      loadPortfolio(targetPct, rfPct, weights, defaultViews);
-      if (backtestData) runBacktest(targetPct, rfPct, neutralPrior, weights, defaultViews);
+      loadPortfolio(targetPct, rfPct, weights, defaultViews, assetNames);
+      if (backtestData) runBacktest(targetPct, rfPct, neutralPrior, weights, defaultViews, assetNames);
     }
   };
 
@@ -279,6 +341,44 @@ export default function Optimizer() {
           </button>
         </div>
       </div>
+
+      {Object.keys(candidateTickers).length > 0 && (
+        <div className="weights-block">
+          <button className="weights-toggle" onClick={() => setShowUniverse((v) => !v)}>
+            {showUniverse ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            Universe ({assetNames.length} of {Object.keys(candidateTickers).length} assets)
+          </button>
+          {showUniverse && (
+            <div className="weights-editor">
+              <p className="weights-help">
+                Which assets to optimise over. Unchecking one drops its weight/view rows below;
+                checking one back on gives it a sensible starting weight automatically. Needs at
+                least 2 assets, and takes a Recalculate to actually re-run (a changed universe
+                means a fresh price download).
+              </p>
+              <div className="universe-grid">
+                {Object.entries(candidateTickers).map(([name, ticker]) => (
+                  <label className="universe-item" key={name}>
+                    <input
+                      type="checkbox"
+                      checked={assetNames.includes(name)}
+                      onChange={(e) => toggleAsset(name, e.target.checked)}
+                    />
+                    <span className="universe-name">{name}</span>
+                    <span className="universe-ticker mono">{ticker}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="weights-actions">
+                <button className="link-btn" onClick={resetUniverse}>
+                  <RotateCcw size={12} /> Reset to defaults
+                </button>
+                <span className="weights-hint">Toggle above, then Recalculate.</span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {assetNames.length > 0 && (
         <div className="weights-block">
@@ -496,7 +596,7 @@ export default function Optimizer() {
                   onClick={() => {
                     const weights = parseWeights(weightsInput);
                     const views = parseViews(viewsInput);
-                    if (weights && views) runBacktest(targetPct, rfPct, neutralPrior, weights, views);
+                    if (weights && views) runBacktest(targetPct, rfPct, neutralPrior, weights, views, assetNames);
                   }}
                   disabled={btLoading}
                 >
@@ -587,6 +687,12 @@ code{font-family:'IBM Plex Mono',monospace; font-size:12px; background:var(--pan
   font-size:12px; font-weight:500; cursor:pointer; padding:0;}
 .link-btn:hover{opacity:.8;}
 .weights-hint{font-size:11.5px; color:var(--muted); font-style:italic;}
+
+.universe-grid{display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px;}
+.universe-item{display:flex; align-items:center; gap:6px; padding:6px 8px; background:var(--paper); border-radius:2px; cursor:pointer;}
+.universe-item input{accent-color:var(--accent); cursor:pointer;}
+.universe-name{font-size:12px; color:var(--ink); flex:1;}
+.universe-ticker{font-size:10.5px; color:var(--muted);}
 
 .views-rows{display:flex; flex-direction:column; gap:9px;}
 .view-row{display:flex; align-items:center; gap:7px; flex-wrap:wrap; padding:8px; background:var(--paper); border-radius:2px;}
